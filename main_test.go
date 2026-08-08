@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 func TestCollectEmailsSplitsDedupesAndValidates(t *testing.T) {
@@ -249,11 +250,18 @@ func TestRegistrationUsesCustomPageInsteadOfConfigFields(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &registration); err != nil {
 		t.Fatalf("decode management registration: %v", err)
 	}
-	if len(registration.Resources) != 1 {
-		t.Fatalf("resources = %#v, want one custom page", registration.Resources)
+	if len(registration.Resources) != 2 {
+		t.Fatalf("resources = %#v, want two custom pages (invite + usage)", registration.Resources)
 	}
-	if got := registration.Resources[0]; got.Path != "/invite" || got.Menu != "Codex Invite" {
-		t.Fatalf("resource = %#v, want /invite Codex Invite", got)
+	resByPath := map[string]pluginapi.ResourceRoute{}
+	for _, res := range registration.Resources {
+		resByPath[res.Path] = res
+	}
+	if got, ok := resByPath["/invite"]; !ok || got.Menu != "Codex Invite" {
+		t.Fatalf("invite resource = %#v, want /invite Codex Invite", resByPath["/invite"])
+	}
+	if got, ok := resByPath["/usage"]; !ok || got.Menu != "Codex Usage" {
+		t.Fatalf("usage resource = %#v, want /usage Codex Usage", resByPath["/usage"])
 	}
 
 	routes := map[string]bool{}
@@ -263,6 +271,8 @@ func TestRegistrationUsesCustomPageInsteadOfConfigFields(t *testing.T) {
 	for _, want := range []string{
 		http.MethodGet + " /codex-invite/accounts",
 		http.MethodPost + " /codex-invite/invite",
+		http.MethodGet + " /codex-invite/usage",
+		http.MethodGet + " /codex-invite/referrals",
 	} {
 		if !routes[want] {
 			t.Fatalf("registered routes = %#v, missing %s", registration.Routes, want)

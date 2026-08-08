@@ -66,17 +66,23 @@ const (
 	maxManagementBodyBytes        = 1 << 20
 	managementAccountsPath        = "/v0/management/codex-invite/accounts"
 	managementInvitePath          = "/v0/management/codex-invite/invite"
+	managementUsagePath           = "/v0/management/codex-invite/usage"
+	managementReferralsPath       = "/v0/management/codex-invite/referrals"
 	resourceInvitePath            = "/v0/resource/plugins/codex-invite/invite"
+	resourceUsagePath             = "/v0/resource/plugins/codex-invite/usage"
 	authFilesPath                 = "/v0/management/auth-files"
 	authFileDownloadPath          = "/v0/management/auth-files/download"
 	inviteEndpointPath            = "/backend-api/wham/referrals/invite"
+	usageEndpointPath             = "/backend-api/codex/usage"
+	referralsStatusEndpointPath   = "/backend-api/wham/referrals/status"
+	referralsCreditsEndpointPath  = "/backend-api/wham/referrals/credits"
 	requestManagementOrigin       = "X-Codex-Invite-Origin"
 	contentTypeJSON               = "application/json; charset=utf-8"
 	contentTypeHTML               = "text/html; charset=utf-8"
 	upstreamBodyLimit       int64 = 1 << 20
 )
 
-var pluginVersion = "0.1.4"
+var pluginVersion = "0.2.0"
 
 var (
 	activeConfig atomic.Value
@@ -249,12 +255,21 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			Routes: []pluginapi.ManagementRoute{
 				{Method: http.MethodGet, Path: "/codex-invite/accounts"},
 				{Method: http.MethodPost, Path: "/codex-invite/invite"},
+				{Method: http.MethodGet, Path: "/codex-invite/usage"},
+				{Method: http.MethodGet, Path: "/codex-invite/referrals"},
 			},
-			Resources: []pluginapi.ResourceRoute{{
-				Path:        "/invite",
-				Menu:        "Codex Invite",
-				Description: "Send Codex invite emails with a selected Codex credential.",
-			}},
+			Resources: []pluginapi.ResourceRoute{
+				{
+					Path:        "/invite",
+					Menu:        "Codex Invite",
+					Description: "Send Codex invite emails with a selected Codex credential.",
+				},
+				{
+					Path:        "/usage",
+					Menu:        "Codex Usage",
+					Description: "Query Codex account credit balance, rate-limit usage, and referral credits.",
+				},
+			},
 		})
 	case pluginabi.MethodManagementHandle:
 		return handleManagement(request)
@@ -385,10 +400,16 @@ func handleManagement(raw []byte) ([]byte, error) {
 	switch {
 	case strings.EqualFold(req.Method, http.MethodGet) && path == resourceInvitePath:
 		return okEnvelope(htmlResponse(http.StatusOK, renderInvitePage(currentConfig())))
+	case strings.EqualFold(req.Method, http.MethodGet) && path == resourceUsagePath:
+		return okEnvelope(htmlResponse(http.StatusOK, renderUsagePage(currentConfig())))
 	case strings.EqualFold(req.Method, http.MethodGet) && path == managementAccountsPath:
 		return okEnvelope(handleAccounts(req.ManagementRequest))
 	case strings.EqualFold(req.Method, http.MethodPost) && path == managementInvitePath:
 		return okEnvelope(handleInvite(req.ManagementRequest))
+	case strings.EqualFold(req.Method, http.MethodGet) && path == managementUsagePath:
+		return okEnvelope(handleUsage(req.ManagementRequest))
+	case strings.EqualFold(req.Method, http.MethodGet) && path == managementReferralsPath:
+		return okEnvelope(handleReferrals(req.ManagementRequest))
 	default:
 		return okEnvelope(jsonResponse(http.StatusNotFound, map[string]any{"error": "plugin route not found"}))
 	}
@@ -459,6 +480,165 @@ func handleInvite(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 	result, errSend := sendInvite(ctx, requestCfg, credential, account, emails, referralKey, strings.TrimSpace(payload.Cookie), strings.TrimSpace(payload.ProxyURL))
 	if errSend != nil {
 		return jsonResponse(statusForError(errSend), map[string]any{"error": errSend.Error()})
+	}
+	return jsonResponse(http.StatusOK, result)
+}
+
+// queryRequest is the shared input shape for the usage and referrals query endpoints.
+type queryRequest struct {
+	AuthIndex        string `json:"auth_index,omitempty"`
+	AuthName         string `json:"auth_name,omitempty"`
+	BaseURL          string `json:"base_url,omitempty"`
+	ProxyURL         string `json:"proxy_url,omitempty"`
+	Language         string `json:"language,omitempty"`
+	Originator       string `json:"originator,omitempty"`
+	UserAgent        string `json:"user_agent,omitempty"`
+	Cookie           string `json:"cookie,omitempty"`
+	ManagementOrigin string `json:"management_origin,omitempty"`
+}
+
+// parseQueryRequest decodes a query request body, tolerant of empty bodies so a plain
+// GET with no JSON still works (the account can be auto-selected when only one exists).
+func parseQueryRequest(body []byte) queryRequest {
+	var payload queryRequest
+	if len(body) > 0 {
+		_ = json.Unmarshal(body, &payload)
+	}
+	return payload
+}
+
+// selectQueryAccount reuses the invite account lister and selector for query endpoints,
+// auto-picking the first account when the caller did not specify one.
+func selectQueryAccount(req pluginapi.ManagementRequest, payload queryRequest) (accountInfo, error) {
+	accounts, errAccounts := fetchCodexAccounts(req, payload.ManagementOrigin)
+	if errAccounts != nil {
+		return accountInfo{}, errAccounts
+	}
+	// Reuse the same selection logic as invite (auth_index / auth_name), but fall back to
+	// the first available account when nothing was requested, which is the common case for
+	// a read-only usage query.
+	manual := inviteRequest{AuthIndex: payload.AuthIndex, AuthName: payload.AuthName}
+	if strings.TrimSpace(payload.AuthIndex) != "" || strings.TrimSpace(payload.AuthName) != "" {
+		return selectAccount(accounts, manual)
+	}
+	if len(accounts) == 0 {
+		return accountInfo{}, httpStatusError{status: http.StatusNotFound, msg: "no available Codex credential found"}
+	}
+	return accounts[0], nil
+}
+
+// usageCredits captures the credit-balance section of GET /backend-api/codex/usage.
+type usageCredits struct {
+	Balance        float64 `json:"balance"`
+	HasSubscription bool   `json:"has_subscription,omitempty"`
+}
+
+// usageRateWindow captures one rate-limit window (primary or secondary).
+type usageRateWindow struct {
+	UsedPercent      float64 `json:"used_percent"`
+	ResetAfterSeconds float64 `json:"reset_after_seconds,omitempty"`
+}
+
+// usageRateLimit captures the rate_limit block from the usage endpoint.
+type usageRateLimit struct {
+	PrimaryWindow   *usageRateWindow `json:"primary_window,omitempty"`
+	SecondaryWindow *usageRateWindow `json:"secondary_window,omitempty"`
+}
+
+// usageResetCredits captures the rate_limit_reset_credits block (the credits granted via referrals).
+type usageResetCredits struct {
+	AvailableCount int `json:"available_count"`
+	UsedCount      int `json:"used_count,omitempty"`
+}
+
+// usageResponse is the structured view returned to the management center.
+type usageResponse struct {
+	OK                bool               `json:"ok"`
+	StatusCode        int                `json:"status_code"`
+	RequestID         string             `json:"request_id,omitempty"`
+	Account           accountInfo        `json:"account"`
+	Credits           *usageCredits      `json:"credits,omitempty"`
+	RateLimit         *usageRateLimit    `json:"rate_limit,omitempty"`
+	ResetCredits      *usageResetCredits `json:"rate_limit_reset_credits,omitempty"`
+	Upstream          any                `json:"upstream,omitempty"`
+	UpstreamRaw       string             `json:"upstream_raw,omitempty"`
+}
+
+// referralsResponse is the structured view of remaining invite capacity.
+type referralsResponse struct {
+	OK                 bool        `json:"ok"`
+	Account            accountInfo `json:"account"`
+	RemainingInvites   any         `json:"remaining_invites,omitempty"`
+	MaxInvites         any         `json:"max_invites,omitempty"`
+	Status             any         `json:"status,omitempty"`
+	UsageEndpointUsed  bool        `json:"usage_endpoint_used,omitempty"`
+	StatusEndpointHit  bool        `json:"status_endpoint_hit,omitempty"`
+	StatusStatusCode   int         `json:"status_endpoint_status_code,omitempty"`
+	Upstream           any         `json:"upstream,omitempty"`
+	UpstreamRaw        string      `json:"upstream_raw,omitempty"`
+	Note               string      `json:"note,omitempty"`
+}
+
+func handleUsage(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	payload := parseQueryRequest(req.Body)
+
+	account, errAccount := selectQueryAccount(req, payload)
+	if errAccount != nil {
+		return jsonResponse(statusForError(errAccount), map[string]any{"error": errAccount.Error()})
+	}
+
+	credential, errCredential := fetchCodexCredential(req, payload.ManagementOrigin, account)
+	if errCredential != nil {
+		return jsonResponse(statusForError(errCredential), map[string]any{"error": errCredential.Error()})
+	}
+	if credential.AccountID == "" {
+		credential.AccountID = account.ChatGPTAccountID
+	}
+
+	cfg := normalizeConfig(mergeConfig(currentConfig(), pluginConfig{
+		BaseURL:    payload.BaseURL,
+		Language:   payload.Language,
+		Originator: payload.Originator,
+		UserAgent:  payload.UserAgent,
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	result, errQuery := fetchCodexUsage(ctx, cfg, credential, account, strings.TrimSpace(payload.Cookie), strings.TrimSpace(payload.ProxyURL))
+	if errQuery != nil {
+		return jsonResponse(statusForError(errQuery), map[string]any{"error": errQuery.Error()})
+	}
+	return jsonResponse(http.StatusOK, result)
+}
+
+func handleReferrals(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	payload := parseQueryRequest(req.Body)
+
+	account, errAccount := selectQueryAccount(req, payload)
+	if errAccount != nil {
+		return jsonResponse(statusForError(errAccount), map[string]any{"error": errAccount.Error()})
+	}
+
+	credential, errCredential := fetchCodexCredential(req, payload.ManagementOrigin, account)
+	if errCredential != nil {
+		return jsonResponse(statusForError(errCredential), map[string]any{"error": errCredential.Error()})
+	}
+	if credential.AccountID == "" {
+		credential.AccountID = account.ChatGPTAccountID
+	}
+
+	cfg := normalizeConfig(mergeConfig(currentConfig(), pluginConfig{
+		BaseURL:    payload.BaseURL,
+		Language:   payload.Language,
+		Originator: payload.Originator,
+		UserAgent:  payload.UserAgent,
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	result, errRefs := fetchReferralCapacity(ctx, cfg, credential, account, strings.TrimSpace(payload.Cookie), strings.TrimSpace(payload.ProxyURL))
+	if errRefs != nil {
+		return jsonResponse(statusForError(errRefs), map[string]any{"error": errRefs.Error()})
 	}
 	return jsonResponse(http.StatusOK, result)
 }
@@ -831,6 +1011,284 @@ func inviteEndpoint(baseURL string) (string, error) {
 	parsed.RawQuery = ""
 	parsed.Fragment = ""
 	return parsed.String(), nil
+}
+
+// codexEndpoint resolves an arbitrary ChatGPT backend-api path against the configured base URL.
+func codexEndpoint(baseURL, endpointPath string) (string, error) {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		baseURL = defaultBaseURL
+	}
+	parsed, errParse := url.Parse(baseURL)
+	if errParse != nil {
+		return "", errParse
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("unsupported ChatGPT base URL scheme")
+	}
+	if parsed.Host == "" {
+		return "", fmt.Errorf("ChatGPT base URL host is required")
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + endpointPath
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), nil
+}
+
+// codexGet performs an authenticated GET against a ChatGPT backend-api endpoint using the same
+// header recipe proven by sendInvite (Bearer access token + Chatgpt-Account-Id + Cookie + UA).
+// Returns the HTTP status, the x-oai-request-id header, and the (size-limited) raw body.
+func codexGet(ctx context.Context, cfg pluginConfig, credential codexCredential, endpointPath, requestCookie, proxyURL string) (status int, requestID string, raw []byte, err error) {
+	endpoint, errEndpoint := codexEndpoint(cfg.BaseURL, endpointPath)
+	if errEndpoint != nil {
+		return 0, "", nil, errEndpoint
+	}
+
+	req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if errRequest != nil {
+		return 0, "", nil, errRequest
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+credential.AccessToken)
+	req.Header.Set("Oai-Language", cfg.Language)
+	req.Header.Set("Originator", cfg.Originator)
+	req.Header.Set("User-Agent", cfg.UserAgent)
+	if credential.AccountID != "" {
+		req.Header.Set("Chatgpt-Account-Id", credential.AccountID)
+	}
+	if cookie := strings.TrimSpace(requestCookie); cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	} else if cfg.Cookie != "" {
+		req.Header.Set("Cookie", cfg.Cookie)
+	}
+
+	client, errClient := inviteHTTPClient(proxyURL)
+	if errClient != nil {
+		return 0, "", nil, errClient
+	}
+	resp, errDo := client.Do(req)
+	if errDo != nil {
+		return 0, "", nil, errDo
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, errRead := readLimited(resp.Body, upstreamBodyLimit)
+	if errRead != nil {
+		return resp.StatusCode, resp.Header.Get("x-oai-request-id"), nil, errRead
+	}
+	return resp.StatusCode, resp.Header.Get("x-oai-request-id"), raw, nil
+}
+
+// fetchCodexUsage calls GET /backend-api/codex/usage and projects the known fields
+// (credits.balance, rate_limit windows, rate_limit_reset_credits) into a stable view,
+// while still echoing the full upstream payload for debugging.
+func fetchCodexUsage(ctx context.Context, cfg pluginConfig, credential codexCredential, account accountInfo, requestCookie, proxyURL string) (usageResponse, error) {
+	status, requestID, raw, errGet := codexGet(ctx, cfg, credential, usageEndpointPath, requestCookie, proxyURL)
+	if errGet != nil {
+		return usageResponse{}, errGet
+	}
+	result := usageResponse{
+		OK:          status >= 200 && status < 300,
+		StatusCode:  status,
+		RequestID:   requestID,
+		Account:     account,
+	}
+	if len(raw) == 0 {
+		return result, nil
+	}
+
+	var data map[string]any
+	if errJSON := json.Unmarshal(raw, &data); errJSON != nil {
+		result.UpstreamRaw = string(raw)
+		return result, nil
+	}
+	result.Upstream = data
+
+	if creditsRaw, ok := data["credits"].(map[string]any); ok {
+		credits := usageCredits{
+			Balance:         toFloat64(creditsRaw["balance"]),
+			HasSubscription: boolValue(creditsRaw["has_subscription"]),
+		}
+		result.Credits = &credits
+	}
+	if rateRaw, ok := data["rate_limit"].(map[string]any); ok {
+		rl := usageRateLimit{}
+		if pw := windowFromAny(rateRaw["primary_window"]); pw != nil {
+			rl.PrimaryWindow = pw
+		}
+		if sw := windowFromAny(rateRaw["secondary_window"]); sw != nil {
+			rl.SecondaryWindow = sw
+		}
+		if rl.PrimaryWindow != nil || rl.SecondaryWindow != nil {
+			result.RateLimit = &rl
+		}
+	}
+	if resetRaw, ok := data["rate_limit_reset_credits"].(map[string]any); ok {
+		result.ResetCredits = &usageResetCredits{
+			AvailableCount: toInt(resetRaw["available_count"]),
+			UsedCount:      toInt(resetRaw["used_count"]),
+		}
+	}
+	return result, nil
+}
+
+func windowFromAny(value any) *usageRateWindow {
+	m, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	return &usageRateWindow{
+		UsedPercent:       toFloat64(m["used_percent"]),
+		ResetAfterSeconds: toFloat64(m["reset_after_seconds"]),
+	}
+}
+
+// fetchReferralCapacity attempts to surface the remaining-invite capacity for an account.
+//
+// ChatGPT does not expose a single canonical "remaining invites" counter; the value moves across
+// the usage payload and the referrals status payload depending on account state and rollout. This
+// helper probes the most informative endpoint that actually responds, in this order:
+//  1. GET /backend-api/wham/referrals/status  — canonical when available (200)
+//  2. GET /backend-api/wham/referrals/credits  — alternate when available (200)
+//  3. GET /backend-api/codex/usage             — fallback: parse rate_limit_reset_credits / any
+//      referral-shaped fields
+//
+// Every probed response is echoed under `upstream`/`upstream_raw`, and the fields that look like a
+// remaining/max invite count are lifted into `remaining_invites` / `max_invites` regardless of the
+// source, so the UI can render a single best-guess number with full transparency below it.
+func fetchReferralCapacity(ctx context.Context, cfg pluginConfig, credential codexCredential, account accountInfo, requestCookie, proxyURL string) (referralsResponse, error) {
+	result := referralsResponse{OK: true, Account: account}
+
+	type probeOutcome struct {
+		statusCode int
+		raw        []byte
+		hit        bool
+	}
+	probe := func(endpointPath string) probeOutcome {
+		status, _, raw, errGet := codexGet(ctx, cfg, credential, endpointPath, requestCookie, proxyURL)
+		if errGet != nil || len(raw) == 0 {
+			return probeOutcome{statusCode: status}
+		}
+		return probeOutcome{statusCode: status, raw: raw, hit: status >= 200 && status < 300}
+	}
+
+	// 1. referrals/status — the most direct source.
+	status := probe(referralsStatusEndpointPath)
+	result.StatusStatusCode = status.statusCode
+	if status.hit {
+		result.StatusEndpointHit = true
+		liftReferralFields(&result, status.raw, "status")
+	} else {
+		// 2. referrals/credits — some accounts expose invite capacity here instead.
+		credits := probe(referralsCreditsEndpointPath)
+		if credits.hit {
+			liftReferralFields(&result, credits.raw, "credits")
+		} else {
+			// 3. usage fallback — least specific, but always available on Pro accounts.
+			usage, errUsage := fetchCodexUsage(ctx, cfg, credential, account, requestCookie, proxyURL)
+			if errUsage == nil && usage.StatusCode >= 200 && usage.StatusCode < 300 {
+				result.UsageEndpointUsed = true
+				result.Note = "referrals/status and referrals/credits did not return data; showing Codex usage payload instead. Invite remaining-count is not exposed by a dedicated endpoint; interpret rate_limit_reset_credits as the referral-granted reset credits."
+				if usage.Upstream != nil {
+					if raw, errMarshal := json.Marshal(usage.Upstream); errMarshal == nil {
+						liftReferralFields(&result, raw, "usage")
+					}
+				} else if usage.UpstreamRaw != "" {
+					result.UpstreamRaw = usage.UpstreamRaw
+				}
+			} else if errUsage != nil {
+				result.Note = fmt.Sprintf("no referral endpoint responded and usage probe failed: %s; ChatGPT likely does not expose a remaining-invite counter for this account.", errUsage.Error())
+			} else {
+				result.Note = fmt.Sprintf("no referral endpoint responded (status=%d, credits=%d); ChatGPT likely does not expose a remaining-invite counter for this account.", status.statusCode, credits.statusCode)
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// liftReferralFields parses an upstream JSON body and copies any field that plausibly represents
+// invite capacity into the response's remaining/max slots and the status mirror, while preserving
+// the full body under upstream/upstream_raw for transparency.
+func liftReferralFields(result *referralsResponse, raw []byte, source string) {
+	if len(raw) == 0 {
+		return
+	}
+	var data map[string]any
+	if errJSON := json.Unmarshal(raw, &data); errJSON != nil {
+		result.UpstreamRaw = string(raw)
+		return
+	}
+	result.Upstream = data
+
+	// Mirror the whole payload under "status" so the UI can render whatever shape the endpoint used.
+	result.Status = data
+
+	// Pick the most plausible "remaining" counter. Candidates span observed field names across
+	// the referrals status, referrals credits, and usage payloads.
+	for _, key := range []string{
+		"remaining_invites", "remaining", "invites_remaining",
+		"available_invites", "available_count", "invites_available",
+		"left", "remaining_count",
+	} {
+		if value, present := lookupNested(data, key); present {
+			result.RemainingInvites = value
+			break
+		}
+	}
+	// Same for the ceiling/max counter.
+	for _, key := range []string{
+		"max_invites", "max", "total_invites", "total", "cap", "limit",
+		"monthly_invites", "invites_per_cycle",
+	} {
+		if value, present := lookupNested(data, key); present {
+			result.MaxInvites = value
+			break
+		}
+	}
+}
+
+// lookupNested resolves a key at the top level OR one level deep under common parent objects
+// (referrals, status, credits, summary), so liftReferralFields stays resilient to shape drift.
+func lookupNested(data map[string]any, key string) (any, bool) {
+	if data == nil {
+		return nil, false
+	}
+	if value, ok := data[key]; ok {
+		return value, true
+	}
+	for _, parent := range []string{"referrals", "status", "credits", "summary", "data"} {
+		if child, ok := data[parent].(map[string]any); ok {
+			if value, ok := child[key]; ok {
+				return value, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// toFloat64 coerces JSON numbers (float64 by default in Go) and numeric strings to float64.
+func toFloat64(value any) float64 {
+	switch v := value.(type) {
+	case float64:
+		return v
+	case float32:
+		return float64(v)
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case string:
+		var f float64
+		_, _ = fmt.Sscanf(strings.TrimSpace(v), "%f", &f)
+		return f
+	default:
+		return 0
+	}
+}
+
+// toInt coerces JSON numbers and numeric strings to int.
+func toInt(value any) int {
+	return int(toFloat64(value))
 }
 
 func extractInviteLinks(raw []byte) []inviteLink {
@@ -1567,6 +2025,252 @@ func renderInvitePage(cfg pluginConfig) string {
     applyLocale();
     loadLocalSettings();
     updateEmailCount();
+  </script>
+</body>
+</html>`
+}
+
+// renderUsagePage returns the management-center page that queries Codex account usage
+// (credit balance, rate-limit usage, referral reset credits) and surfaces the remaining
+// invite capacity for the selected credential.
+func renderUsagePage(cfg pluginConfig) string {
+	defaults := map[string]any{
+		"baseURL":    cfg.BaseURL,
+		"language":   cfg.Language,
+		"originator": cfg.Originator,
+		"userAgent":  cfg.UserAgent,
+	}
+	rawDefaults, errMarshal := json.Marshal(defaults)
+	if errMarshal != nil {
+		rawDefaults = []byte(`{"baseURL":"https://chatgpt.com","language":"zh-CN","originator":"Codex Desktop","userAgent":""}`)
+	}
+	return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex Usage</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: Canvas;
+      color: CanvasText;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: Canvas; color: CanvasText; }
+    main { max-width: 920px; margin: 0 auto; padding: 24px; }
+    header { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+    h1 { margin: 0; font-size: 24px; font-weight: 760; }
+    h2 { margin: 0 0 14px; font-size: 15px; font-weight: 720; }
+    label { display: grid; gap: 7px; font-size: 13px; font-weight: 650; min-width: 0; }
+    input, select, button { font: inherit; width: 100%; }
+    input, select {
+      border: 1px solid color-mix(in srgb, CanvasText 18%, Canvas 82%);
+      border-radius: 6px; padding: 9px 10px; background: Canvas; color: CanvasText;
+    }
+    button {
+      border: 0; border-radius: 6px; padding: 9px 12px;
+      background: #0f766e; color: #fff; font-weight: 720; cursor: pointer; white-space: nowrap;
+    }
+    button.secondary { background: color-mix(in srgb, CanvasText 10%, Canvas 90%); color: CanvasText; }
+    button:disabled { opacity: .54; cursor: not-allowed; }
+    .row { display: grid; grid-template-columns: 1fr; gap: 12px; margin-bottom: 16px; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+    .panel {
+      border: 1px solid color-mix(in srgb, CanvasText 14%, Canvas 86%);
+      border-radius: 8px; padding: 16px; margin-bottom: 16px;
+      background: color-mix(in srgb, Canvas 96%, CanvasText 4%);
+    }
+    .metric { display: grid; grid-template-columns: minmax(140px, 220px) 1fr; gap: 8px 16px; align-items: baseline; }
+    .metric dt { font-size: 12px; font-weight: 650; opacity: .82; }
+    .metric dd { margin: 0; font-size: 14px; font-weight: 600; word-break: break-word; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 720; }
+    .badge.ok { background: color-mix(in srgb, #10b981 22%, Canvas 78%); color: CanvasText; }
+    .badge.warn { background: color-mix(in srgb, #b45309 22%, Canvas 78%); color: CanvasText; }
+    .badge.err { background: color-mix(in srgb, #dc2626 22%, Canvas 78%); color: CanvasText; }
+    pre {
+      margin: 8px 0 0; padding: 12px; border-radius: 6px; overflow: auto;
+      background: color-mix(in srgb, CanvasText 6%, Canvas 94%);
+      font-size: 12px; line-height: 1.5; max-height: 420px;
+    }
+    details > summary { cursor: pointer; font-size: 12px; font-weight: 650; margin-top: 10px; }
+    .hint { font-size: 12px; opacity: .78; margin-top: 8px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Codex Usage</h1>
+    </header>
+
+    <section class="panel">
+      <h2>Account</h2>
+      <div class="row">
+        <label>
+          <span>Codex credential</span>
+          <select id="account"></select>
+        </label>
+      </div>
+      <div class="actions">
+        <button id="reload" class="secondary" type="button">Reload accounts</button>
+        <button id="queryUsage" type="button">Query usage</button>
+        <button id="queryReferrals" type="button">Query remaining invites</button>
+        <button id="clearResult" class="secondary" type="button">Clear</button>
+      </div>
+      <p class="hint">
+        Query usage: calls <code>GET /backend-api/codex/usage</code> to read credit balance, rate-limit usage,
+        and referral-granted reset credits.<br>
+        Query remaining invites: probes <code>/backend-api/wham/referrals/status</code> then
+        <code>/credits</code>, falling back to the usage payload. ChatGPT does not expose a single dedicated
+        remaining-invite counter, so the best available number plus the raw upstream body are both shown.
+      </p>
+    </section>
+
+    <section class="panel" id="resultPanel" hidden>
+      <h2 id="resultTitle">Result</h2>
+      <dl class="metric" id="metrics"></dl>
+      <details><summary>Raw upstream response</summary><pre id="raw"></pre></details>
+    </section>
+  </main>
+
+  <script>
+    const DEFAULTS = ` + "`" + string(rawDefaults) + "`" + `;
+    const settings = Object.assign({ baseURL: 'https://chatgpt.com', language: 'zh-CN', originator: 'Codex Desktop', userAgent: '' }, DEFAULTS);
+    const origin = (window.location && window.location.origin) || 'http://127.0.0.1:8317';
+    function authHeaders() {
+      const key = new URLSearchParams(window.location.search).get('key') || localStorage.getItem('cpa-management-key') || '';
+      return key ? { Authorization: 'Bearer ' + key } : {};
+    }
+    const accountSelect = document.getElementById('account');
+    const reloadBtn = document.getElementById('reload');
+    const usageBtn = document.getElementById('queryUsage');
+    const refsBtn = document.getElementById('queryReferrals');
+    const clearBtn = document.getElementById('clearResult');
+    const resultPanel = document.getElementById('resultPanel');
+    const resultTitle = document.getElementById('resultTitle');
+    const metrics = document.getElementById('metrics');
+    const rawPre = document.getElementById('raw');
+
+    async function readJSON(response) {
+      const text = await response.text();
+      try { return JSON.parse(text); } catch { return { raw: text }; }
+    }
+    function fmtNumber(v) {
+      if (v === null || v === undefined || v === '') return '—';
+      if (typeof v === 'number') return Number.isFinite(v) ? v.toLocaleString() : String(v);
+      return String(v);
+    }
+    function pctBadge(pct) {
+      const n = Number(pct);
+      if (!Number.isFinite(n)) return fmtNumber(pct);
+      const cls = n >= 90 ? 'err' : n >= 70 ? 'warn' : 'ok';
+      return '<span class="badge ' + cls + '">' + n.toFixed(1) + '%</span>';
+    }
+    function setMetric(rows) {
+      metrics.innerHTML = '';
+      for (const [k, v] of rows) {
+        const dt = document.createElement('dt'); dt.textContent = k;
+        const dd = document.createElement('dd'); dd.innerHTML = v;
+        metrics.appendChild(dt); metrics.appendChild(dd);
+      }
+    }
+    function showResult(title, rows, rawObj) {
+      resultTitle.textContent = title;
+      setMetric(rows);
+      try { rawPre.textContent = JSON.stringify(rawObj, null, 2); }
+      catch { rawPre.textContent = String(rawObj); }
+      resultPanel.hidden = false;
+    }
+    async function loadAccounts() {
+      reloadBtn.disabled = true;
+      try {
+        const response = await fetch('/v0/management/codex-invite/accounts', { headers: authHeaders() });
+        const data = await readJSON(response);
+        if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
+        accountSelect.innerHTML = '';
+        for (const acc of data.accounts || []) {
+          const opt = document.createElement('option');
+          opt.value = acc.auth_index || acc.name;
+          opt.dataset.name = acc.name;
+          opt.textContent = acc.email || acc.label || acc.name;
+          accountSelect.appendChild(opt);
+        }
+        if (!accountSelect.options.length) accountSelect.innerHTML = '<option>(no Codex credential)</option>';
+      } catch (e) {
+        accountSelect.innerHTML = '<option>(failed to load: ' + (e.message || e) + ')</option>';
+      } finally {
+        reloadBtn.disabled = false;
+      }
+    }
+    async function queryEndpoint(path, title) {
+      const selected = accountSelect.selectedOptions[0];
+      if (!selected) return;
+      usageBtn.disabled = refsBtn.disabled = true;
+      try {
+        const payload = {
+          auth_index: selected.value,
+          auth_name: selected.dataset.name || '',
+          base_url: settings.baseURL,
+          language: settings.language,
+          originator: settings.originator,
+          user_agent: settings.userAgent,
+          management_origin: origin
+        };
+        const response = await fetch(path, {
+          method: 'GET',
+          headers: Object.assign({}, authHeaders(), { 'Content-Type': 'application/json' }),
+          body: JSON.stringify(payload)
+        });
+        const data = await readJSON(response);
+        if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
+        if (path.indexOf('usage') !== -1 && path.indexOf('referrals') === -1) {
+          renderUsage(data);
+        } else {
+          renderReferrals(data);
+        }
+      } catch (e) {
+        showResult('Error', [['message', String(e.message || e)]], { error: String(e.message || e) });
+      } finally {
+        usageBtn.disabled = refsBtn.disabled = false;
+      }
+    }
+    function renderUsage(d) {
+      const rows = [];
+      const c = d.credits || {};
+      const rl = d.rate_limit || {};
+      const rc = d.rate_limit_reset_credits || {};
+      rows.push(['Account', (d.account && (d.account.email || d.account.name)) || '—']);
+      rows.push(['HTTP status', '<span class="badge ' + (d.ok ? 'ok' : 'err') + '">' + d.status_code + '</span>']);
+      rows.push(['Credit balance', fmtNumber(c.balance)]);
+      rows.push(['Subscription', c.has_subscription ? 'yes' : 'no']);
+      if (rl.primary_window) {
+        rows.push(['Primary usage', pctBadge(rl.primary_window.used_percent)]);
+        rows.push(['Primary reset', fmtNumber(rl.primary_window.reset_after_seconds) + ' s']);
+      }
+      if (rl.secondary_window) {
+        rows.push(['Weekly usage', pctBadge(rl.secondary_window.used_percent)]);
+        rows.push(['Weekly reset', fmtNumber(rl.secondary_window.reset_after_seconds) + ' s']);
+      }
+      rows.push(['Reset credits available', fmtNumber(rc.available_count)]);
+      rows.push(['Reset credits used', fmtNumber(rc.used_count)]);
+      showResult('Usage — ' + ((d.account && (d.account.email || d.account.name)) || 'Codex'), rows, d);
+    }
+    function renderReferrals(d) {
+      const rows = [];
+      rows.push(['Account', (d.account && (d.account.email || d.account.name)) || '—']);
+      rows.push(['Remaining invites', fmtNumber(d.remaining_invites)]);
+      rows.push(['Max invites', fmtNumber(d.max_invites)]);
+      rows.push(['Source', d.usage_endpoint_used ? 'usage endpoint (fallback)' : (d.status_endpoint_hit ? 'referrals/status' : 'referrals/credits')]);
+      if (d.note) rows.push(['Note', '<span style="white-space:pre-wrap">' + d.note + '</span>']);
+      showResult('Remaining invites — ' + ((d.account && (d.account.email || d.account.name)) || 'Codex'), rows, d);
+    }
+
+    reloadBtn.addEventListener('click', loadAccounts);
+    usageBtn.addEventListener('click', () => queryEndpoint('/v0/management/codex-invite/usage', 'Usage'));
+    refsBtn.addEventListener('click', () => queryEndpoint('/v0/management/codex-invite/referrals', 'Referrals'));
+    clearBtn.addEventListener('click', () => { resultPanel.hidden = true; metrics.innerHTML = ''; rawPre.textContent = ''; });
+    loadAccounts();
   </script>
 </body>
 </html>`
