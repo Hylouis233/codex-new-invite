@@ -1,151 +1,99 @@
-# Codex Invite CLIProxyAPI Plugin
+# cpa-plugin-codex-invite
 
-`codex-invite` is a CLIProxyAPI dynamic library plugin that exposes
-Management UI resources for **sending Codex referral invite emails** and
-**querying Codex account usage / remaining invite capacity** with an existing
-Codex OAuth credential managed by CPA.
+A [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) plugin that sends Codex referral invite emails **and** queries Codex account usage / invite reward status, using a selected Codex OAuth credential managed by CPA.
 
-The plugin does not persist ChatGPT access tokens. At request time it reads
-the selected Codex auth file through CPA's authenticated Management API,
-extracts the current `access_token` and account ID, and calls:
+Fork of [LTbinglingfeng/cpa-plugin-codex-invite](https://github.com/LTbinglingfeng/cpa-plugin-codex-invite) with major additions: Codex usage query, remaining-invite reward query (reverse-engineered from the Codex desktop app), uTLS Cloudflare bypass, bilingual UI (English / 中文), and the new-v2 referral invite endpoint.
 
-- `POST https://chatgpt.com/backend-api/wham/referrals/invite` — send invites
-- `GET https://chatgpt.com/backend-api/codex/usage` — credit balance, rate-limit usage, and referral-granted reset credits
-- `GET https://chatgpt.com/backend-api/wham/referrals/status` and `/credits` — best-effort remaining-invite probe (falls back to the usage payload)
+## Features
 
-## Configuration
+### Send invites (Codex Invite page)
 
-The plugin does not expose invite fields in the Management Center plugin
-configuration form. Plugin config is only used to enable the plugin:
+- Pick a Codex credential from your CPA auth files **or manually enter an `access_token` / `account_id`** (for credentials not managed by CPA). Manual credentials are used in-memory only and never persisted.
+- Uses the **new referral invite endpoint** (`POST /backend-api/referrals/invite` with `program_id` / `entrypoint` / `emails`) reverse-engineered from the Codex desktop app, with automatic fallback to the legacy `wham/referrals/invite` endpoint.
+- Supports proxy (HTTP / HTTPS / SOCKS5).
 
-```yaml
-plugins:
-  enabled: true
-  configs:
-    codex-invite:
-      enabled: true
-      priority: 1
-```
+### Query usage (Codex Usage page)
 
-## Resource Page
+- **Credit balance**, rate-limit usage (primary + weekly windows), and referral-granted reset credits — from `GET /backend-api/codex/usage`.
+- **Remaining invite reward** — from `GET /backend-api/referrals/invite/eligibility?program_id=...&entrypoint=...`, showing:
+  - Reward title & description (e.g. "获得 250/500 额度")
+  - Per-side grant amounts (referrer + recipient)
+  - Remaining send capacity (how many invites you can still send this month)
+  - Remaining reward capacity (how many rewards you can still earn this month)
+  - Eligibility rules
+- **Invite tracking** — how many invites sent in the past 90 days, from `GET /backend-api/referrals/invite/tracking`.
+- Bilingual UI with locale auto-detection (English / 中文), persisted to localStorage.
 
-The plugin resource page is available at:
+### Redeem reward (Codex Usage page)
 
-```text
-/v0/resource/plugins/codex-invite/invite
-```
+- **Redeem** a banked rate-limit reset credit — `POST /v0/management/codex-invite/redeem`, which lists banked credits (`GET /backend-api/wham/rate-limit-reset-credits`) and redeems the first available one via `POST /backend-api/wham/rate-limit-reset-credits/consume` (`credit_id` + a generated `redeem_request_id`).
+- This is the step that actually applies an earned referral reward — without redeeming, the credit stays banked and does not restore your rate-limit window.
 
-It provides:
+## What's new in this fork (v0.2.0)
 
-- CPA management key entry for authenticated Management API calls.
-- Codex credential loading and account selection from CPA auth files.
-- Invite settings for referral key, ChatGPT base URL, language, originator, user agent, request email limit, and optional Cookie.
-- A visible per-request proxy URL field in the invite form.
-- Local browser settings for non-secret fields, excluding proxy URL.
-- Invite execution through `POST /v0/management/codex-invite/invite`.
+| Change | Why |
+|--------|-----|
+| **uTLS Chrome fingerprint** for all upstream ChatGPT requests | Go's default TLS fingerprint is blocked by Cloudflare. The plugin now uses `HelloChrome_Auto` (same as the CPA host process), so usage/referral/invite queries pass Cloudflare **without any browser Cookie**. |
+| **New referral invite endpoint** (`/backend-api/referrals/invite`) | The desktop app uses a new endpoint with `program_id`/`entrypoint` body shape. The plugin tries the new endpoint first, falling back to legacy. |
+| **Invite eligibility + tracking queries** | Reverse-engineered from the Codex desktop app's `app.asar`. Shows remaining invite/reward capacity, reward amounts, rules — the same data the desktop UI shows. |
+| **Banked reset-credits query** (`/wham/rate-limit-reset-credits`) | Shows how many referral-granted reset credits an account has earned and has available. |
+| **Redeem reward** (`POST /codex-invite/redeem` → `/wham/rate-limit-reset-credits/consume`) | Actually applies a banked referral reward to restore your rate-limit window. |
+| **Manual credential mode** | Invite with an `access_token`/`account_id` you enter directly, for accounts not managed by CPA. In-memory only, never persisted. |
+| **Bilingual UI (EN / 中文)** | Both the Invite and Usage pages support English and Chinese, with locale auto-detection and persistence. |
+| **Usage page fixes** | Added management-key input, `X-Codex-Invite-Origin` header, GET→POST for fetch-body support, and account-status metrics on the referrals fallback path. |
 
-### Usage page
+## How the Cloudflare bypass works
 
-The plugin also registers a second resource page at:
+ChatGPT's Cloudflare WAF blocks requests whose TLS ClientHello fingerprint doesn't match a real browser. Go's standard `net/http` produces a recognizable Go fingerprint → 403. The CPA host process solves this with [uTLS](https://github.com/refraction-networking/utls) (`HelloChrome_Auto`).
 
-```text
-/v0/resource/plugins/codex-invite/usage
-```
+This plugin ships its own uTLS round tripper (mirroring the host's `utlsRoundTripper`) so the plugin's direct requests to `chatgpt.com` carry a Chrome TLS fingerprint and pass Cloudflare — **no Cookie required**.
 
-It provides read-only queries against the selected Codex credential:
+## Endpoints
 
-- **Query usage** — calls `GET /v0/management/codex-invite/usage`, which proxies
-  `GET https://chatgpt.com/backend-api/codex/usage` and surfaces:
-  - `credits.balance` — current credit balance
-  - `rate_limit.primary_window.used_percent` / `reset_after_seconds` — 5h usage window
-  - `rate_limit.secondary_window.*` — weekly usage window (when present)
-  - `rate_limit_reset_credits.available_count` / `used_count` — referral-granted reset credits
-- **Query remaining invites** — calls `GET /v0/management/codex-invite/referrals`,
-  which probes `GET /backend-api/wham/referrals/status` then `/credits`, falling
-  back to the usage payload. ChatGPT does not expose a single dedicated
-  remaining-invite counter, so the best available number plus the raw upstream
-  body are both shown for transparency.
+### Management API routes
 
-Both query endpoints accept an optional JSON body (empty body is fine for a
-plain GET with a single account):
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/v0/management/codex-invite/accounts` | List available Codex credentials |
+| POST | `/v0/management/codex-invite/invite` | Send referral invite emails |
+| POST | `/v0/management/codex-invite/usage` | Query credit balance + rate-limit usage |
+| POST | `/v0/management/codex-invite/referrals` | Query invite eligibility + tracking + remaining capacity |
+| POST | `/v0/management/codex-invite/redeem` | Redeem one banked rate-limit reset credit |
+| POST | `/v0/management/codex-invite/probe` | Diagnostic: probe arbitrary `/backend-api/*` paths |
 
-```json
-{
-  "auth_index": "<optional>",
-  "auth_name": "<optional>",
-  "management_origin": "http://127.0.0.1:8317"
-}
-```
+### Upstream ChatGPT endpoints used
 
-The page does not store the CPA management key, proxy URL, or Cookie in `localStorage`.
-Invite details and account choice are entered in this custom page, not in the
-plugin configuration form.
+| Method | Endpoint | Source |
+|--------|----------|--------|
+| POST | `/backend-api/referrals/invite` | Codex desktop app (new) |
+| POST | `/backend-api/wham/referrals/invite` | Legacy fallback |
+| GET | `/backend-api/codex/usage` | Codex CLI / VS Code extension |
+| GET | `/backend-api/referrals/invite/eligibility` | Codex desktop app (`app.asar`) |
+| GET | `/backend-api/referrals/invite/tracking` | Codex desktop app (`app.asar`) |
+| GET | `/backend-api/wham/rate-limit-reset-credits` | VS Code extension webview bundle |
+| POST | `/backend-api/wham/rate-limit-reset-credits/consume` | Redeem a banked reset credit (`credit_id`, `redeem_request_id`) |
+| GET | `/backend-api/wham/usage` | Codex CLI |
 
 ## Build
 
-```bash
-make test
-make build
-make package
+Requires Go 1.26+ and a C compiler (CGO is enabled for the c-shared DLL).
+
+```sh
+export CGO_ENABLED=1 GOOS=windows GOARCH=amd64
+go build -trimpath -buildmode=c-shared \
+  -ldflags "-s -w -X main.pluginVersion=0.2.0" \
+  -o dist/codex-invite.dll .
 ```
 
-On macOS this creates:
+Deploy the built DLL to your CPA `plugins/<os>/<arch>/` directory (e.g. `plugins/windows/amd64/codex-invite-v0.2.0.dll`) and restart CPA.
 
-```text
-dist/codex-invite.dylib
-dist/codex-invite_0.1.4_darwin_arm64.zip
-dist/codex-invite_0.1.4_darwin_arm64.zip.sha256
-```
+## Usage
 
-Install locally by copying the dynamic library to CPA's plugin discovery
-directory, for example:
+1. Open the CPA management center (`http://127.0.0.1:<port>/management.html`).
+2. Open **Codex Invite** or **Codex Usage** from the plugin menu.
+3. Enter your CPA management key (saved to localStorage for convenience).
+4. Select a Codex credential, then query usage / send invites.
 
-```bash
-mkdir -p /path/to/CLIProxyAPI/plugins/darwin/arm64
-cp dist/codex-invite.dylib /path/to/CLIProxyAPI/plugins/darwin/arm64/codex-invite.dylib
-```
+## License
 
-Target platform, output directory, and runtime plugin version can be overridden:
-
-```bash
-make build GOOS=darwin GOARCH=arm64 BUILD_DIR=/path/to/plugins/darwin/arm64
-make package VERSION=0.1.4
-```
-
-## Plugin Store Release
-
-For plugin-store installation, each GitHub release must include:
-
-```text
-codex-invite_<version>_<goos>_<goarch>.zip
-checksums.txt
-```
-
-Each zip must contain the dynamic library at the zip root:
-
-- Darwin: `codex-invite.dylib`
-- Linux: `codex-invite.so`
-- Windows: `codex-invite.dll`
-
-`checksums.txt` must be in sha256sum format.
-
-Generate a local aggregate checksum file with:
-
-```bash
-make checksums VERSION=0.1.4
-```
-
-## Management API
-
-The plugin registers:
-
-- `GET /v0/management/codex-invite/accounts`
-- `POST /v0/management/codex-invite/invite`
-- `GET /v0/management/codex-invite/usage`
-- `GET /v0/management/codex-invite/referrals`
-- resource page `/v0/resource/plugins/codex-invite/invite`
-- resource page `/v0/resource/plugins/codex-invite/usage`
-
-The resource page asks for the CPA management key because plugin iframes are
-served from the CPA backend origin and cannot read the Management Center's
-frontend auth store.
+MIT

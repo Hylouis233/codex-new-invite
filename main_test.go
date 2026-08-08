@@ -115,26 +115,27 @@ func TestSendInviteUsesConfiguredProxy(t *testing.T) {
 	}
 
 	select {
-	case req := <-seen:
-		if req.Method != http.MethodPost {
-			t.Fatalf("proxied method = %q, want POST", req.Method)
+		case req := <-seen:
+			if req.Method != http.MethodPost {
+				t.Fatalf("proxied method = %q, want POST", req.Method)
+			}
+			// sendInvite tries the new V2 endpoint first (/backend-api/referrals/invite).
+			wantURL := "http://chatgpt.example/backend-api/referrals/invite"
+			if req.URL != wantURL {
+				t.Fatalf("proxied URL = %q, want %q", req.URL, wantURL)
+			}
+			if req.Authorization != "Bearer access-1" {
+				t.Fatalf("authorization = %q", req.Authorization)
+			}
+			if req.ContentType != "application/json" {
+				t.Fatalf("content type = %q", req.ContentType)
+			}
+			if !strings.Contains(req.Body, `"program_id":"codex_referral_consumer"`) || !strings.Contains(req.Body, `"entrypoint":"persistent"`) || !strings.Contains(req.Body, `"emails":["user@example.com"]`) {
+				t.Fatalf("body = %q", req.Body)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("proxy did not receive invite request")
 		}
-		wantURL := "http://chatgpt.example/backend-api/wham/referrals/invite"
-		if req.URL != wantURL {
-			t.Fatalf("proxied URL = %q, want %q", req.URL, wantURL)
-		}
-		if req.Authorization != "Bearer access-1" {
-			t.Fatalf("authorization = %q", req.Authorization)
-		}
-		if req.ContentType != "application/json" {
-			t.Fatalf("content type = %q", req.ContentType)
-		}
-		if !strings.Contains(req.Body, `"referral_key":"ref-key"`) || !strings.Contains(req.Body, `"emails":["user@example.com"]`) {
-			t.Fatalf("body = %q", req.Body)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("proxy did not receive invite request")
-	}
 }
 
 func TestRenderInvitePageDoesNotPersistProxyURL(t *testing.T) {
@@ -271,11 +272,31 @@ func TestRegistrationUsesCustomPageInsteadOfConfigFields(t *testing.T) {
 	for _, want := range []string{
 		http.MethodGet + " /codex-invite/accounts",
 		http.MethodPost + " /codex-invite/invite",
-		http.MethodGet + " /codex-invite/usage",
-		http.MethodGet + " /codex-invite/referrals",
+		http.MethodPost + " /codex-invite/usage",
+		http.MethodPost + " /codex-invite/referrals",
+		http.MethodPost + " /codex-invite/probe",
+		http.MethodPost + " /codex-invite/redeem",
 	} {
 		if !routes[want] {
 			t.Fatalf("registered routes = %#v, missing %s", registration.Routes, want)
 		}
+	}
+}
+
+func TestResolveManualCredential(t *testing.T) {
+	// Empty access_token -> manual mode off.
+	if _, _, manual := resolveManualCredential("", "acct-1", "a@example.com"); manual {
+		t.Fatalf("manual mode should be off when access_token is empty")
+	}
+	// Present access_token -> manual mode on, credential populated.
+	cred, acc, manual := resolveManualCredential("token-abc", "acct-1", "a@example.com")
+	if !manual {
+		t.Fatalf("manual mode should be on when access_token is present")
+	}
+	if cred.AccessToken != "token-abc" || cred.AccountID != "acct-1" || cred.Email != "a@example.com" {
+		t.Fatalf("credential = %#v", cred)
+	}
+	if acc.Source != "manual" {
+		t.Fatalf("account source = %q, want manual", acc.Source)
 	}
 }
