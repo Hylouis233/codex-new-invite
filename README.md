@@ -1,4 +1,4 @@
-# cpa-plugin-codex-invite
+# codex-new-invite
 
 A [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) plugin that sends Codex referral invite emails **and** queries Codex account usage / invite reward status, using a selected Codex OAuth credential managed by CPA.
 
