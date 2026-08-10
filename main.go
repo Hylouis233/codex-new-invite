@@ -51,6 +51,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"os"
+	"os/exec"
 	"time"
 	"unsafe"
 
@@ -78,6 +80,7 @@ const (
 	managementReferralsPath       = "/v0/management/codex-invite/referrals"
 	managementProbePath           = "/v0/management/codex-invite/probe"
 	managementRedeemPath          = "/v0/management/codex-invite/redeem"
+	managementActivatePath        = "/v0/management/codex-invite/activate"
 	resourceInvitePath            = "/v0/resource/plugins/codex-invite/invite"
 	resourceUsagePath             = "/v0/resource/plugins/codex-invite/usage"
 	authFilesPath                 = "/v0/management/auth-files"
@@ -296,6 +299,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 				{Method: http.MethodPost, Path: "/codex-invite/referrals"},
 				{Method: http.MethodPost, Path: "/codex-invite/probe"},
 				{Method: http.MethodPost, Path: "/codex-invite/redeem"},
+				{Method: http.MethodPost, Path: "/codex-invite/activate"},
 		},
 			Resources: []pluginapi.ResourceRoute{
 				{
@@ -453,6 +457,8 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return okEnvelope(handleProbe(req.ManagementRequest))
 	case strings.EqualFold(req.Method, http.MethodPost) && path == managementRedeemPath:
 		return okEnvelope(handleRedeem(req.ManagementRequest))
+	case strings.EqualFold(req.Method, http.MethodPost) && path == managementActivatePath:
+		return okEnvelope(handleActivate(req.ManagementRequest))
 	default:
 		return okEnvelope(jsonResponse(http.StatusNotFound, map[string]any{"error": "plugin route not found"}))
 	}
@@ -548,6 +554,9 @@ type queryRequest struct {
 	AccessToken string `json:"access_token,omitempty"`
 	AccountID   string `json:"account_id,omitempty"`
 	ManualEmail string `json:"manual_email,omitempty"`
+	// Activate endpoint fields
+	Email string `json:"email,omitempty"`
+	Card  string `json:"card,omitempty"`
 }
 
 // parseQueryRequest decodes a query request body, tolerant of empty bodies so a plain
@@ -1035,6 +1044,102 @@ func collectEmails(req inviteRequest, maxEmails int) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// handleActivate 调用 _full_v5.py 完成全链路激活（登录→OTP→邀请→OAuth→手机验证→token→codex消息→CPA导出）
+// 接收 email + card 参数，返回 JSON 结果。长期运行（OTP等待+手机验证可能数分钟）。
+func handleActivate(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	payload := parseQueryRequest(req.Body)
+	email := strings.TrimSpace(payload.Email)
+	card := strings.TrimSpace(payload.Card)
+
+	if email == "" {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "email required"})
+	}
+	// card 可为空（DRY RUN）或非空（激活）
+
+	// 定位 _full_v5.py
+	scriptPath := ""
+	for _, candidate := range []string{
+		`G:\Github\playground\codex-auto-invite\_full_v5.py`,
+		`/opt/codex-auto-invite/_full_v5.py`,
+		`./codex-auto-invite/_full_v5.py`,
+	} {
+		if _, err := os.Stat(candidate); err == nil {
+			scriptPath = candidate
+			break
+		}
+	}
+	if scriptPath == "" {
+		return jsonResponse(http.StatusInternalServerError, map[string]any{
+			"error": "_full_v5.py not found in any known location",
+		})
+	}
+
+	// 构建命令行参数
+	args := []string{scriptPath, "--email", email, "--json"}
+	if card != "" {
+		args = append(args, "--card", card)
+	} else {
+		args = append(args, "--dry-run")
+	}
+	// mail-auth 从环境变量或固定值
+	mailAuth := os.Getenv("MAIL_AUTH")
+	if mailAuth == "" {
+		mailAuth = "lhdmm1230" // 默认值（Mox bridge）
+	}
+	args = append(args, "--mail-auth", mailAuth)
+
+	// 调用 Python 脚本（最长 10 分钟超时）
+	cmd := exec.Command("python", args...)
+	// Windows 下 python 可能需要完整路径
+	if _, err := exec.LookPath("python"); err != nil {
+		// 尝试常见路径
+		for _, py := range []string{
+			`C:\Python313\python.exe`,
+			`C:\Users\10126\AppData\Local\Programs\Python\Python311\python.exe`,
+		} {
+			if _, err := os.Stat(py); err == nil {
+				cmd = exec.Command(py, args...)
+				break
+			}
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	cmd = exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		// 脚本出错——检查是否有 JSON 输出
+		output := stdout.String()
+		var result map[string]any
+		if err := json.Unmarshal([]byte(output), &result); err == nil {
+			result["exit_error"] = err.Error()
+			return jsonResponse(http.StatusOK, result)
+		}
+		return jsonResponse(http.StatusInternalServerError, map[string]any{
+			"error":   err.Error(),
+			"stdout":  stdout.String()[:2000],
+			"stderr":  stderr.String()[:500],
+			"timeout": ctx.Err() != nil,
+		})
+	}
+
+	// 解析 JSON 输出
+	output := stdout.String()
+	var result map[string]any
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		return jsonResponse(http.StatusInternalServerError, map[string]any{
+			"error": "failed to parse script output: " + err.Error(),
+			"stdout": output[:2000],
+		})
+	}
+	return jsonResponse(http.StatusOK, result)
 }
 
 func splitEmailList(raw string) []string {
@@ -2943,6 +3048,11 @@ func renderUsagePage(cfg pluginConfig) string {
         <button id="redeem" type="button" class="warning" data-i18n="account.redeem">Redeem reward</button>
         <button id="clearResult" class="secondary" type="button" data-i18n="account.clear">Clear</button>
       </div>
+      <div class="actions" style="margin-top:8px">
+        <input id="activateEmail" type="text" placeholder="email@example.com" style="flex:1;min-width:200px">
+        <input id="activateCard" type="text" placeholder="LeadBee card (empty=dry run)" style="flex:1;min-width:200px">
+        <button id="activate" type="button" class="warning" data-i18n="account.activate">Activate</button>
+      </div>
       <p class="hint" data-i18n="account.hint">
         Query usage: calls GET /backend-api/codex/usage to read credit balance, rate-limit usage,
         and referral-granted reset credits. Query remaining invites: probes /backend-api/wham/referrals/status then
@@ -2976,6 +3086,7 @@ func renderUsagePage(cfg pluginConfig) string {
         'account.queryReferrals': 'Query remaining invites',
         'account.clear': 'Clear',
         'account.redeem': 'Redeem reward',
+        'account.activate': 'Activate (one-click)',
         'redeem.confirm': 'Redeem one banked rate-limit reset credit for this account? This will consume the credit immediately.',
         'redeem.none': 'No available credits to redeem (available_count = 0). Earn rewards via invites first.',
         'redeem.success': 'Reward redeemed successfully! windows_reset={count}',
@@ -3020,6 +3131,23 @@ func renderUsagePage(cfg pluginConfig) string {
         'metric.referrerReward': 'Referrer reward',
         'metric.recipientReward': 'Recipient reward',
         'metric.rules': 'Rules',
+        'metric.quotaUsage': 'Quota usage',
+        'metric.pendingInvites': 'Pending invites',
+        'metric.expiresAt': 'Expires at',
+        'metric.grantDetail': 'Reward',
+        'metric.resendStatus': 'Resend',
+        'metric.canResend': 'Resendable now',
+        'metric.resendAt': 'Resend available at',
+        'metric.notResendable': 'No',
+        'metric.eligible': 'Eligible',
+        'metric.noReward': 'No reward',
+        'metric.eligibleCount': 'Eligible accounts',
+        'status.pending': 'pending',
+        'status.accepted': 'accepted',
+        'status.completed': 'completed',
+        'status.expired': 'expired',
+        'quota.send': 'Send quota',
+        'quota.reward': 'Reward quota',
         'secondsSuffix': ' s',
         'usage.titleSuffix': 'Usage — {name}',
         'referrals.titleSuffix': 'Remaining invites — {name}',
@@ -3038,6 +3166,7 @@ func renderUsagePage(cfg pluginConfig) string {
         'account.queryReferrals': '查询剩余邀请次数',
         'account.clear': '清空',
         'account.redeem': '兑换奖励',
+        'account.activate': '激活（一键）',
         'redeem.confirm': '确定为该账号兑换一个已存储的速率限制重置额度？此操作会立即消耗该额度。',
         'redeem.none': '没有可兑换的额度（available_count = 0）。请先通过邀请获得奖励。',
         'redeem.success': '奖励兑换成功！已重置窗口数：{count}',
@@ -3082,6 +3211,23 @@ func renderUsagePage(cfg pluginConfig) string {
         'metric.referrerReward': '邀请者奖励',
         'metric.recipientReward': '被邀请者奖励',
         'metric.rules': '规则',
+        'metric.quotaUsage': '配额用量',
+        'metric.pendingInvites': '待处理邀请',
+        'metric.expiresAt': '过期时间',
+        'metric.grantDetail': '奖励',
+        'metric.resendStatus': '重发',
+        'metric.canResend': '现在可重发',
+        'metric.resendAt': '可重发时间',
+        'metric.notResendable': '否',
+        'metric.eligible': '有资格',
+        'metric.noReward': '无奖励',
+        'metric.eligibleCount': '有资格账号',
+        'status.pending': '待处理',
+        'status.accepted': '已接受',
+        'status.completed': '已完成',
+        'status.expired': '已过期',
+        'quota.send': '发送配额',
+        'quota.reward': '奖励配额',
         'secondsSuffix': ' 秒',
         'usage.titleSuffix': '用量 — {name}',
         'referrals.titleSuffix': '剩余邀请次数 — {name}',
@@ -3168,6 +3314,14 @@ func renderUsagePage(cfg pluginConfig) string {
       const n = Number(epochSec);
       if (!Number.isFinite(n) || n <= 0) return '—';
       try { return new Date(n * 1000).toLocaleString(); } catch { return String(epochSec); }
+    }
+    function fmtTime(v) {
+      // 兼容 epoch 秒 / epoch 毫秒 / ISO 字符串；无法识别则原样返回。
+      if (v === null || v === undefined || v === '') return '—';
+      if (typeof v === 'number') return fmtEpoch(v > 1e12 ? v / 1000 : v);
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) return fmtEpoch(n > 1e12 ? n / 1000 : n);
+      try { const d = new Date(v); return isNaN(d.getTime()) ? String(v) : d.toLocaleString(); } catch { return String(v); }
     }
     function pctBadge(pct) {
       const n = Number(pct);
@@ -3285,6 +3439,64 @@ func renderUsagePage(cfg pluginConfig) string {
       if (d.tracking_endpoint_hit) {
         rows.push([t('metric.invitesSent'), fmtNumber(d.tracking_invite_count)]);
       }
+      // Quota usage from eligibility.time_frame_rules (send/reward capacity consumed this cycle).
+      const tfr = (d.eligibility_endpoint_hit && d.eligibility && Array.isArray(d.eligibility.time_frame_rules))
+        ? d.eligibility.time_frame_rules : [];
+      for (const rule of tfr) {
+        const cap = String(rule.capacity_type || rule.type || '');
+        const labelKey = cap === 'reward' ? 'quota.reward' : 'quota.send';
+        const used = fmtNumber(rule.invites_sent);
+        const total = fmtNumber(rule.invites_total);
+        const frame = rule.time_frame || '';
+        rows.push([t(labelKey) + ' (' + frame + ')', used + ' / ' + total]);
+      }
+      // Pending / sent invite details from tracking.items (full JSON is passed through in d.tracking).
+      // Each invite_url contains a base64 referral_context whose has_rewards marks eligibility.
+      const trackItems = (d.tracking_endpoint_hit && d.tracking && Array.isArray(d.tracking.items))
+        ? d.tracking.items : [];
+      let eligibleCount = 0;
+      function decodeRewardEligible(url) {
+        if (!url) return null;
+        const m = String(url).match(/referral_context=([^&]+)/);
+        if (!m) return null;
+        try {
+          const b64 = m[1].replace(/-/g, '+').replace(/_/g, '/');
+          const json = decodeURIComponent(escape(atob(b64)));
+          const ctx = JSON.parse(json);
+          return ctx && typeof ctx.has_rewards === 'boolean' ? ctx.has_rewards : null;
+        } catch (e) { return null; }
+      }
+      for (const item of trackItems) {
+        const email = item.email || item.referral_id || '—';
+        const status = String(item.status || '');
+        const statusCls = status === 'completed' || status === 'accepted' ? 'ok' : (status === 'pending' ? 'warn' : 'err');
+        const statusText = (TRANSLATIONS[state.locale] || TRANSLATIONS.en)['status.' + status] ? t('status.' + status) : (status || '—');
+        const parts = ['<span class="badge ' + statusCls + '">' + statusText + '</span>'];
+        // Eligibility (has_rewards): decode from invite_url's referral_context.
+        const hasRewards = decodeRewardEligible(item.invite_url);
+        if (hasRewards === true) {
+          parts.push('<span class="badge ok">' + t('metric.eligible') + '</span>');
+          eligibleCount += 1;
+        } else if (hasRewards === false) {
+          parts.push('<span class="badge err">' + t('metric.noReward') + '</span>');
+        }
+        if (item.expires_at !== undefined && item.expires_at !== null) parts.push(t('metric.expiresAt') + ': ' + fmtTime(item.expires_at));
+        // Reward detail: grants inside each tracking item.
+        const grants = Array.isArray(item.grants) ? item.grants : [];
+        const grantSum = grants.reduce((acc, g) => acc + (Number(g.amount) || 0), 0);
+        if (grants.length) parts.push(t('metric.grantDetail') + ': ' + fmtNumber(grantSum));
+        // Resend info.
+        if (item.can_resend === true) {
+          parts.push('<span class="badge ok">' + t('metric.canResend') + '</span>');
+        } else if (item.resend_available_at !== undefined && item.resend_available_at !== null) {
+          parts.push(t('metric.resendAt') + ': ' + fmtTime(item.resend_available_at));
+        }
+        rows.push([t('metric.pendingInvites') + ': ' + email, parts.join(' &nbsp;|&nbsp; ')]);
+      }
+      // Eligible-account summary (has_rewards=True).
+      if (trackItems.length) {
+        rows.push([t('metric.eligibleCount'), '<strong class="ok">' + eligibleCount + '</strong> / ' + trackItems.length]);
+      }
       // Eligibility hit → remaining_reward_capacity is the "max rewards left" ceiling.
       if (d.eligibility_endpoint_hit && d.max_invites != null) {
         rows.push([t('metric.remainingReward'), fmtNumber(d.max_invites)]);
@@ -3372,15 +3584,56 @@ func renderUsagePage(cfg pluginConfig) string {
         }
       } catch (e) {
         showResult(t('redeem.failed'), [['message', String(e.message || e)]], { error: String(e.message || e) });
-      } finally {
-        redeemBtn.disabled = usageBtn.disabled = refsBtn.disabled = false;
+        } finally {
+          redeemBtn.disabled = usageBtn.disabled = refsBtn.disabled = false;
+        }
       }
-    }
+      // Activate: one-click full chain (email + card → _full_v5.py)
+      const activateBtn = document.getElementById('activate');
+      const activateEmailInput = document.getElementById('activateEmail');
+      const activateCardInput = document.getElementById('activateCard');
+      async function activateAccount() {
+        const email = (activateEmailInput && activateEmailInput.value.trim()) || '';
+        const card = (activateCardInput && activateCardInput.value.trim()) || '';
+        if (!email) { showResult(t('error.title'), [['message', 'email required']], { error: 'email required' }); return; }
+        const isDryRun = !card;
+        const label = isDryRun ? 'DRY RUN' : 'ACTIVATE';
+        if (!window.confirm(isDryRun
+          ? 'DRY RUN: run full chain for ' + email + ' without consuming a card?'
+          : 'ACTIVATE: consume card ' + card.slice(0, 8) + '... for ' + email + '? This will run the full chain including phone verification.')) return;
+        activateBtn.disabled = usageBtn.disabled = refsBtn.disabled = redeemBtn.disabled = true;
+        try {
+          showResult(label + ' in progress...', [['email', email], ['card', card ? card.slice(0, 8) + '...' : '(dry run)'], ['status', 'Running _full_v5.py... (this may take 5-10 minutes)']], {});
+          const response = await fetch('/v0/management/codex-invite/activate', {
+            method: 'POST',
+            headers: Object.assign({}, authHeaders(), { 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ email: email, card: card })
+          });
+          const data = await readJSON(response);
+          if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
+          const rows = [
+            ['email', data.email || email],
+            ['success', data.success ? '✅' : '❌'],
+            ['phone_verified', data.phone_verified ? '✅' : '❌'],
+            ['codex_sent', data.codex_sent ? '✅' : '❌'],
+            ['cpa_exported', data.cpa_exported ? '✅' : '❌'],
+            ['account_id', data.account_id || '—'],
+          ];
+          if (data.error) rows.push(['error', data.error]);
+          if (data.cpa_path) rows.push(['cpa_path', data.cpa_path]);
+          showResult(data.success ? '✅ ' + label + ' succeeded' : '❌ ' + label + ' failed', rows, data);
+        } catch (e) {
+          showResult(label + ' failed', [['message', String(e.message || e)]], { error: String(e.message || e) });
+        } finally {
+          activateBtn.disabled = usageBtn.disabled = refsBtn.disabled = redeemBtn.disabled = false;
+        }
+      }
     localeSelect.addEventListener('change', () => changeLocale(localeSelect.value));
     reloadBtn.addEventListener('click', () => guardKey(loadAccounts));
     usageBtn.addEventListener('click', () => guardKey(() => queryEndpoint('/v0/management/codex-invite/usage', 'Usage')));
     refsBtn.addEventListener('click', () => guardKey(() => queryEndpoint('/v0/management/codex-invite/referrals', 'Referrals')));
     redeemBtn.addEventListener('click', () => guardKey(redeemReward));
+    activateBtn.addEventListener('click', () => guardKey(activateAccount));
     clearBtn.addEventListener('click', () => { resultPanel.hidden = true; metrics.innerHTML = ''; rawPre.textContent = ''; });
     keyInput.addEventListener('input', () => persistManagementKey(keyInput.value.trim()));
 
