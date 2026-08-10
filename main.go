@@ -3615,7 +3615,7 @@ func renderUsagePage(cfg pluginConfig) string {
             ['email', data.email || email],
             ['success', data.success ? '✅' : '❌'],
             ['phone_verified', data.phone_verified ? '✅' : '❌'],
-            ['codex_sent', data.codex_sent ? '✅' : '❌'],
+            ['codex_launched', data.codex_launched ? '✅' : '❌'],
             ['cpa_exported', data.cpa_exported ? '✅' : '❌'],
             ['account_id', data.account_id || '—'],
           ];
