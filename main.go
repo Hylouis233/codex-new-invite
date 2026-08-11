@@ -1225,15 +1225,13 @@ func handleDesktopActivate(req pluginapi.ManagementRequest) pluginapi.Management
 		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "email required"})
 	}
 
-	// 定位脚本（本机路径）
+	// 定位脚本（fullScript 必须存在；sendScript 仅非 DRY RUN 时需要）
 	fullScript := "G:\\Github\\playground\\codex-auto-invite\\_full_v6.py"
 	sendScript := "G:\\Github\\playground\\codex-auto-invite\\_codex_send_msg.py"
-	for _, s := range []string{fullScript, sendScript} {
-		if _, err := os.Stat(s); err != nil {
-			return jsonResponse(http.StatusInternalServerError, map[string]any{
-				"error": "script not found: " + s,
-			})
-		}
+	if _, err := os.Stat(fullScript); err != nil {
+		return jsonResponse(http.StatusInternalServerError, map[string]any{
+			"error": "_full_v6.py not found: " + fullScript,
+		})
 	}
 
 	pyExe := "python"
@@ -1322,6 +1320,11 @@ func handleDesktopActivate(req pluginapi.ManagementRequest) pluginapi.Management
 	}
 
 	// Step 2: _codex_send_msg.py (send message in Codex app)
+	if _, err := os.Stat(sendScript); err != nil {
+		result["success"] = false
+		result["error"] = "_codex_send_msg.py not found (needed for message sending)"
+		return jsonResponse(http.StatusOK, result)
+	}
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Minute)
 	cmd2 := exec.CommandContext(ctx2, pyExe, sendScript, "--msg", "Say hello")
 	var stdout2, stderr2 bytes.Buffer
