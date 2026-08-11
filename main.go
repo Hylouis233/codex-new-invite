@@ -81,6 +81,7 @@ const (
 	managementProbePath           = "/v0/management/codex-invite/probe"
 	managementRedeemPath          = "/v0/management/codex-invite/redeem"
 	managementActivatePath        = "/v0/management/codex-invite/activate"
+	managementCDPActivatePath     = "/v0/management/codex-invite/cdp-activate"
 	resourceInvitePath            = "/v0/resource/plugins/codex-invite/invite"
 	resourceUsagePath             = "/v0/resource/plugins/codex-invite/usage"
 	authFilesPath                 = "/v0/management/auth-files"
@@ -300,6 +301,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 				{Method: http.MethodPost, Path: "/codex-invite/probe"},
 				{Method: http.MethodPost, Path: "/codex-invite/redeem"},
 				{Method: http.MethodPost, Path: "/codex-invite/activate"},
+				{Method: http.MethodPost, Path: "/codex-invite/cdp-activate"},
 		},
 			Resources: []pluginapi.ResourceRoute{
 				{
@@ -459,6 +461,8 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return okEnvelope(handleRedeem(req.ManagementRequest))
 	case strings.EqualFold(req.Method, http.MethodPost) && path == managementActivatePath:
 		return okEnvelope(handleActivate(req.ManagementRequest))
+	case strings.EqualFold(req.Method, http.MethodPost) && path == managementCDPActivatePath:
+		return okEnvelope(handleCDPActivate(req.ManagementRequest))
 	default:
 		return okEnvelope(jsonResponse(http.StatusNotFound, map[string]any{"error": "plugin route not found"}))
 	}
@@ -1137,6 +1141,69 @@ func handleActivate(req pluginapi.ManagementRequest) pluginapi.ManagementRespons
 		return jsonResponse(http.StatusInternalServerError, map[string]any{
 			"error": "failed to parse script output: " + err.Error(),
 			"stdout": output[:2000],
+		})
+	}
+	return jsonResponse(http.StatusOK, result)
+}
+
+// handleCDPActivate 通过 CDP 在 ChatGPT Desktop 里注入 cookie 并发消息（触发 codex_turn）
+// 调用 Python 脚本完成：CloakBrowser登录导出cookie → CDP注入 → 发消息
+func handleCDPActivate(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	payload := parseQueryRequest(req.Body)
+	email := strings.TrimSpace(payload.Email)
+	if email == "" {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "email required"})
+	}
+
+	// 定位 CDP 脚本
+	scriptPath := ""
+	for _, candidate := range []string{
+		`G:\Github\playground\codex-auto-invite\_cdp_auto.py`,
+		`/opt/codex-auto-invite/_cdp_auto.py`,
+	} {
+		if _, err := os.Stat(candidate); err == nil {
+			scriptPath = candidate
+			break
+		}
+	}
+	if scriptPath == "" {
+		return jsonResponse(http.StatusInternalServerError, map[string]any{
+			"error": "_cdp_auto.py not found",
+		})
+	}
+
+	args := []string{scriptPath, "--host", "127.0.0.1", "--email", email, "--msg", "Hello"}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	pyExe := "python"
+	for _, py := range []string{`C:\Python313\python.exe`, `C:\Users\10126\AppData\Local\Programs\Python\Python311\python.exe`} {
+		if _, err := os.Stat(py); err == nil {
+			pyExe = py
+			break
+		}
+	}
+
+	cmd := exec.CommandContext(ctx, pyExe, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return jsonResponse(http.StatusOK, map[string]any{
+			"success":  false,
+			"error":    err.Error(),
+			"stdout":   stdout.String()[:min(2000, stdout.Len())],
+			"timeout":  ctx.Err() != nil,
+		})
+	}
+
+	output := stdout.String()
+	var result map[string]any
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		return jsonResponse(http.StatusOK, map[string]any{
+			"success": true,
+			"stdout":  output[:min(2000, len(output))],
 		})
 	}
 	return jsonResponse(http.StatusOK, result)
