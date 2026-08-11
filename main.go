@@ -1278,16 +1278,26 @@ func handleDesktopActivate(req pluginapi.ManagementRequest) pluginapi.Management
 		return jsonResponse(http.StatusOK, result)
 	}
 
-	// Parse full_v6 JSON output
+	// Parse full_v6 JSON output (JSON is on the last line of stdout)
 	var v6Result map[string]any
-	if json.Unmarshal([]byte(out1), &v6Result) == nil {
+	// 提取最后一行 JSON（_full_v6.py 先输出日志，最后一行是 JSON）
+	out1Lines := strings.Split(strings.TrimSpace(out1), "\n")
+	jsonLine := out1Lines[len(out1Lines)-1]
+	if json.Unmarshal([]byte(jsonLine), &v6Result) == nil {
 		if errMsg, ok := v6Result["error"]; ok {
 			result["success"] = false
 			result["error"] = errMsg
 			return jsonResponse(http.StatusOK, result)
 		}
-		result["account_id"] = v6Result["account_id"]
-		result["tracking_after_accept"] = v6Result["tracking_after_accept"]
+		if aid, ok := v6Result["account_id"]; ok {
+			result["account_id"] = aid
+		}
+		if ta, ok := v6Result["tracking_after_accept"]; ok {
+			result["tracking_after_accept"] = ta
+		}
+		if oauth, ok := v6Result["oauth_status"]; ok {
+			result["oauth_status"] = oauth
+		}
 	}
 
 	// DRY RUN stops here (no message sending)
@@ -1300,7 +1310,7 @@ func handleDesktopActivate(req pluginapi.ManagementRequest) pluginapi.Management
 	// Step 2: _codex_send_msg.py (send message in Codex app)
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Minute)
 	cmd2 := exec.CommandContext(ctx2, pyExe, sendScript, "--msg", "Say hello")
-	var stdout2 bytes.Buffer
+	var stdout2, stderr2 bytes.Buffer
 	cmd2.Stdout = &stdout2
 	cmd2.Stderr = &stderr2
 	err2 := cmd2.Run()
@@ -3817,23 +3827,29 @@ func renderUsagePage(cfg pluginConfig) string {
       desktopActivateBtn.addEventListener('click', () => guardKey(async () => {
         const email = (activateEmailInput && activateEmailInput.value.trim()) || '';
         if (!email) { showResult(t('error.title'), [['message', 'email required']], { error: 'email required' }); return; }
-        if (!window.confirm('Desktop Activate: run CDP OAuth + auth.json injection + send message in Codex app for ' + email + '?\n\nPrerequisite: Codex app (ChatGPT.exe --remote-debugging-port=9222) must be running on hylouis2.')) return;
+        const cardVal = (activateCardInput && activateCardInput.value.trim()) || '';
+        const isDryRunDesktop = !cardVal;
+        if (!window.confirm(isDryRunDesktop
+          ? 'Desktop Activate (DRY RUN): run accept-referral + OTP login for ' + email + '?'
+          : 'Desktop Activate: run full chain (accept-referral + OTP + OAuth + send message) for ' + email + '?')) return;
         desktopActivateBtn.disabled = true;
         try {
-          showResult('Desktop Activate in progress...', [['email', email], ['status', 'Running CDP OAuth (OTP login → consent → workspace/select → token exchange → auth.json)...']], {});
+          showResult('Desktop Activate in progress...', [['email', email], ['card', cardVal ? cardVal.slice(0, 8) + '...' : '(dry run)'], ['status', 'Running accept-referral → OTP → OAuth → auth.json...']], {});
           const response = await fetch('/v0/management/codex-invite/desktop-activate', {
             method: 'POST',
             headers: Object.assign({}, authHeaders(), { 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ email: email })
+            body: JSON.stringify({ email: email, card: cardVal })
           });
           const data = await readJSON(response);
           if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
-          const rows = [['email', data.email || email], ['success', data.success ? '✅' : '❌']];
-          if (data.auth_json_written) rows.push(['auth_json', '✅ written']);
+          const rows = [['email', data.email || email], ['dry_run', data.dry_run ? '✅' : '❌'], ['success', data.success ? '✅' : '❌']];
+          if (data.tracking_after_accept) rows.push(['tracking', data.tracking_after_accept]);
+          if (data.oauth_status) rows.push(['oauth', data.oauth_status]);
+          if (data.account_id) rows.push(['account_id', String(data.account_id).slice(0, 16) + '...']);
           if (data.steps) {
             for (const [name, stepData] of Object.entries(data.steps)) {
               const sd = stepData || {};
-              rows.push(['step.' + name, sd.error ? '❌ ' + String(sd.error).slice(0, 80) : '✅']);
+              rows.push(['step.' + name, sd.success === false ? '❌' : '✅']);
             }
           }
           if (data.error) rows.push(['error', data.error]);
