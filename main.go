@@ -1281,9 +1281,20 @@ func handleDesktopActivate(req pluginapi.ManagementRequest) pluginapi.Management
 	// Parse full_v6 JSON output (JSON is on the last line of stdout)
 	var v6Result map[string]any
 	// 提取最后一行 JSON（_full_v6.py 先输出日志，最后一行是 JSON）
-	out1Lines := strings.Split(strings.TrimSpace(out1), "\n")
+	out1Trimmed := strings.TrimSpace(out1)
+	out1Lines := strings.Split(out1Trimmed, "\n")
 	jsonLine := out1Lines[len(out1Lines)-1]
-	if json.Unmarshal([]byte(jsonLine), &v6Result) == nil {
+	if json.Unmarshal([]byte(jsonLine), &v6Result) != nil {
+		// fallback: 从 stdout 全文搜索包含 "success" 的 JSON 行
+		for _, line := range out1Lines {
+			if strings.Contains(line, `"success"`) && strings.HasPrefix(strings.TrimSpace(line), "{") {
+				if json.Unmarshal([]byte(strings.TrimSpace(line)), &v6Result) == nil {
+					break
+				}
+			}
+		}
+	}
+	if v6Result != nil {
 		if errMsg, ok := v6Result["error"]; ok {
 			result["success"] = false
 			result["error"] = errMsg
@@ -1297,6 +1308,9 @@ func handleDesktopActivate(req pluginapi.ManagementRequest) pluginapi.Management
 		}
 		if oauth, ok := v6Result["oauth_status"]; ok {
 			result["oauth_status"] = oauth
+		}
+		if success, ok := v6Result["success"]; ok {
+			result["v6_success"] = success
 		}
 	}
 
