@@ -82,6 +82,7 @@ const (
 	managementRedeemPath          = "/v0/management/codex-invite/redeem"
 	managementActivatePath        = "/v0/management/codex-invite/activate"
 	managementCDPActivatePath     = "/v0/management/codex-invite/cdp-activate"
+	managementDesktopActivatePath = "/v0/management/codex-invite/desktop-activate"
 	resourceInvitePath            = "/v0/resource/plugins/codex-invite/invite"
 	resourceUsagePath             = "/v0/resource/plugins/codex-invite/usage"
 	authFilesPath                 = "/v0/management/auth-files"
@@ -302,6 +303,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 				{Method: http.MethodPost, Path: "/codex-invite/redeem"},
 				{Method: http.MethodPost, Path: "/codex-invite/activate"},
 				{Method: http.MethodPost, Path: "/codex-invite/cdp-activate"},
+				{Method: http.MethodPost, Path: "/codex-invite/desktop-activate"},
 		},
 			Resources: []pluginapi.ResourceRoute{
 				{
@@ -463,6 +465,8 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return okEnvelope(handleActivate(req.ManagementRequest))
 	case strings.EqualFold(req.Method, http.MethodPost) && path == managementCDPActivatePath:
 		return okEnvelope(handleCDPActivate(req.ManagementRequest))
+	case strings.EqualFold(req.Method, http.MethodPost) && path == managementDesktopActivatePath:
+		return okEnvelope(handleDesktopActivate(req.ManagementRequest))
 	default:
 		return okEnvelope(jsonResponse(http.StatusNotFound, map[string]any{"error": "plugin route not found"}))
 	}
@@ -1206,6 +1210,80 @@ func handleCDPActivate(req pluginapi.ManagementRequest) pluginapi.ManagementResp
 			"stdout":  output[:min(2000, len(output))],
 		})
 	}
+	return jsonResponse(http.StatusOK, result)
+}
+
+// handleDesktopActivate 通过 CDP OAuth 全流程在 Codex 桌面 app 里登录并发消息（触发 codex_turn）。
+// 流程：_codex_oauth_cdp.py（OTP→consent→workspace/select→token交换→auth.json）→
+//       _codex_send_msg.py（在 Codex app 发消息）
+// 前提：hylouis2 上 Codex app（ChatGPT.exe --remote-debugging-port=9222）已启动
+func handleDesktopActivate(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	payload := parseQueryRequest(req.Body)
+	email := strings.TrimSpace(payload.Email)
+	if email == "" {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "email required"})
+	}
+
+	// 定位脚本（本机路径）
+	oauthScript := "G:\\Github\\playground\\codex-auto-invite\\_codex_oauth_cdp.py"
+	sendScript := "G:\\Github\\playground\\codex-auto-invite\\_codex_send_msg.py"
+	for _, s := range []string{oauthScript, sendScript} {
+		if _, err := os.Stat(s); err != nil {
+			return jsonResponse(http.StatusInternalServerError, map[string]any{
+				"error": "script not found: " + s,
+			})
+		}
+	}
+
+	pyExe := "python"
+	for _, py := range []string{`C:\Python313\python.exe`, `C:\Users\10126\AppData\Local\Programs\Python\Python311\python.exe`} {
+		if _, err := os.Stat(py); err == nil {
+			pyExe = py
+			break
+		}
+	}
+
+	steps := []struct {
+		name string
+		args []string
+	}{
+		{"oauth", []string{oauthScript, "--email", email}},
+		{"send_msg", []string{sendScript, "--msg", "Say hello"}},
+	}
+
+	result := map[string]any{"email": email, "steps": map[string]any{}}
+	for _, step := range steps {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		cmd := exec.CommandContext(ctx, pyExe, step.args...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		cancel()
+		out := stdout.String()
+		stepResult := map[string]any{
+			"stdout": out[:min(2000, len(out))],
+		}
+		if err != nil {
+			stepResult["error"] = err.Error()
+			se := stderr.String()
+			if len(se) > 0 {
+				stepResult["stderr"] = se[:min(500, len(se))]
+			}
+			result["steps"].(map[string]any)[step.name] = stepResult
+			result["success"] = false
+			result["error"] = "failed at step: " + step.name
+			return jsonResponse(http.StatusOK, result)
+		}
+		result["steps"].(map[string]any)[step.name] = stepResult
+	}
+
+	// auth.json 写入成功判断
+	authPath := "G:\\Github\\playground\\codex-auto-invite\\codex_auth.json"
+	if data, err := os.ReadFile(authPath); err == nil && len(data) > 100 {
+		result["auth_json_written"] = true
+	}
+	result["success"] = true
 	return jsonResponse(http.StatusOK, result)
 }
 
@@ -3119,6 +3197,7 @@ func renderUsagePage(cfg pluginConfig) string {
         <input id="activateEmail" type="text" placeholder="email@example.com" style="flex:1;min-width:200px">
         <input id="activateCard" type="text" placeholder="LeadBee card (empty=dry run)" style="flex:1;min-width:200px">
         <button id="activate" type="button" class="warning" data-i18n="account.activate">Activate</button>
+        <button id="desktopActivate" type="button" class="warning" data-i18n="account.desktopActivate" title="CDP OAuth + auth.json injection + Codex app message (triggers codex_turn)">Desktop Activate</button>
       </div>
       <p class="hint" data-i18n="account.hint">
         Query usage: calls GET /backend-api/codex/usage to read credit balance, rate-limit usage,
@@ -3701,6 +3780,40 @@ func renderUsagePage(cfg pluginConfig) string {
     refsBtn.addEventListener('click', () => guardKey(() => queryEndpoint('/v0/management/codex-invite/referrals', 'Referrals')));
     redeemBtn.addEventListener('click', () => guardKey(redeemReward));
     activateBtn.addEventListener('click', () => guardKey(activateAccount));
+    // Desktop Activate: CDP OAuth + auth.json + Codex app message
+    const desktopActivateBtn = document.getElementById('desktopActivate');
+    if (desktopActivateBtn) {
+      desktopActivateBtn.addEventListener('click', () => guardKey(async () => {
+        const email = (activateEmailInput && activateEmailInput.value.trim()) || '';
+        if (!email) { showResult(t('error.title'), [['message', 'email required']], { error: 'email required' }); return; }
+        if (!window.confirm('Desktop Activate: run CDP OAuth + auth.json injection + send message in Codex app for ' + email + '?\n\nPrerequisite: Codex app (ChatGPT.exe --remote-debugging-port=9222) must be running on hylouis2.')) return;
+        desktopActivateBtn.disabled = true;
+        try {
+          showResult('Desktop Activate in progress...', [['email', email], ['status', 'Running CDP OAuth (OTP login → consent → workspace/select → token exchange → auth.json)...']], {});
+          const response = await fetch('/v0/management/codex-invite/desktop-activate', {
+            method: 'POST',
+            headers: Object.assign({}, authHeaders(), { 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ email: email })
+          });
+          const data = await readJSON(response);
+          if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
+          const rows = [['email', data.email || email], ['success', data.success ? '✅' : '❌']];
+          if (data.auth_json_written) rows.push(['auth_json', '✅ written']);
+          if (data.steps) {
+            for (const [name, stepData] of Object.entries(data.steps)) {
+              const sd = stepData || {};
+              rows.push(['step.' + name, sd.error ? '❌ ' + String(sd.error).slice(0, 80) : '✅']);
+            }
+          }
+          if (data.error) rows.push(['error', data.error]);
+          showResult(data.success ? '✅ Desktop Activate succeeded' : '❌ Desktop Activate failed', rows, data);
+        } catch (e) {
+          showResult('Desktop Activate failed', [['message', String(e.message || e)]], { error: String(e.message || e) });
+        } finally {
+          desktopActivateBtn.disabled = false;
+        }
+      }));
+    }
     clearBtn.addEventListener('click', () => { resultPanel.hidden = true; metrics.innerHTML = ''; rawPre.textContent = ''; });
     keyInput.addEventListener('input', () => persistManagementKey(keyInput.value.trim()));
 
