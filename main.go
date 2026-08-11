@@ -1213,21 +1213,22 @@ func handleCDPActivate(req pluginapi.ManagementRequest) pluginapi.ManagementResp
 	return jsonResponse(http.StatusOK, result)
 }
 
-// handleDesktopActivate 通过 CDP OAuth 全流程在 Codex 桌面 app 里登录并发消息（触发 codex_turn）。
-// 流程：_codex_oauth_cdp.py（OTP→consent→workspace/select→token交换→auth.json）→
-//       _codex_send_msg.py（在 Codex app 发消息）
+// handleDesktopActivate 通过 accept-referral 先行 → OTP → Codex OAuth → auth.json → Codex app 发消息。
+// 正确顺序（2026-08-12 确认）：先点击邀请链接，再登录，然后在 Codex 发消息。
+// 流程：_full_v6.py（accept-referral→OTP→OAuth→auth.json）→ _codex_send_msg.py（Codex app 发消息）
 // 前提：hylouis2 上 Codex app（ChatGPT.exe --remote-debugging-port=9222）已启动
 func handleDesktopActivate(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	payload := parseQueryRequest(req.Body)
 	email := strings.TrimSpace(payload.Email)
+	card := strings.TrimSpace(payload.Card)
 	if email == "" {
 		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "email required"})
 	}
 
 	// 定位脚本（本机路径）
-	oauthScript := "G:\\Github\\playground\\codex-auto-invite\\_codex_oauth_cdp.py"
+	fullScript := "G:\\Github\\playground\\codex-auto-invite\\_full_v6.py"
 	sendScript := "G:\\Github\\playground\\codex-auto-invite\\_codex_send_msg.py"
-	for _, s := range []string{oauthScript, sendScript} {
+	for _, s := range []string{fullScript, sendScript} {
 		if _, err := os.Stat(s); err != nil {
 			return jsonResponse(http.StatusInternalServerError, map[string]any{
 				"error": "script not found: " + s,
@@ -1243,46 +1244,76 @@ func handleDesktopActivate(req pluginapi.ManagementRequest) pluginapi.Management
 		}
 	}
 
-	steps := []struct {
-		name string
-		args []string
-	}{
-		{"oauth", []string{oauthScript, "--email", email}},
-		{"send_msg", []string{sendScript, "--msg", "Say hello"}},
+	// Step 1: _full_v6.py（accept-referral → OTP → OAuth → auth.json）
+	isDryRun := card == ""
+	step1Args := []string{fullScript, "--email", email, "--json"}
+	if isDryRun {
+		step1Args = append(step1Args, "--dry-run")
+	} else {
+		step1Args = append(step1Args, "--card", card)
 	}
 
-	result := map[string]any{"email": email, "steps": map[string]any{}}
-	for _, step := range steps {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		cmd := exec.CommandContext(ctx, pyExe, step.args...)
-		var stdout, stderr bytes.Buffer
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-		err := cmd.Run()
-		cancel()
-		out := stdout.String()
-		stepResult := map[string]any{
-			"stdout": out[:min(2000, len(out))],
+	result := map[string]any{"email": email, "dry_run": isDryRun, "steps": map[string]any{}}
+
+	// Run _full_v6.py (up to 10 min for OTP wait)
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 10*time.Minute)
+	cmd1 := exec.CommandContext(ctx1, pyExe, step1Args...)
+	var stdout1, stderr1 bytes.Buffer
+	cmd1.Stdout = &stdout1
+	cmd1.Stderr = &stderr1
+	err1 := cmd1.Run()
+	cancel1()
+	out1 := stdout1.String()
+	result["steps"].(map[string]any)["full_v6"] = map[string]any{
+		"stdout":  out1[:min(3000, len(out1))],
+		"success": err1 == nil,
+	}
+	if err1 != nil {
+		se := stderr1.String()
+		if len(se) > 0 {
+			result["steps"].(map[string]any)["full_v6"].(map[string]any)["stderr"] = se[:min(500, len(se))]
 		}
-		if err != nil {
-			stepResult["error"] = err.Error()
-			se := stderr.String()
-			if len(se) > 0 {
-				stepResult["stderr"] = se[:min(500, len(se))]
-			}
-			result["steps"].(map[string]any)[step.name] = stepResult
+		result["success"] = false
+		result["error"] = "failed at step: full_v6 (accept-referral + OAuth)"
+		return jsonResponse(http.StatusOK, result)
+	}
+
+	// Parse full_v6 JSON output
+	var v6Result map[string]any
+	if json.Unmarshal([]byte(out1), &v6Result) == nil {
+		if errMsg, ok := v6Result["error"]; ok {
 			result["success"] = false
-			result["error"] = "failed at step: " + step.name
+			result["error"] = errMsg
 			return jsonResponse(http.StatusOK, result)
 		}
-		result["steps"].(map[string]any)[step.name] = stepResult
+		result["account_id"] = v6Result["account_id"]
+		result["tracking_after_accept"] = v6Result["tracking_after_accept"]
 	}
 
-	// auth.json 写入成功判断
-	authPath := "G:\\Github\\playground\\codex-auto-invite\\codex_auth.json"
-	if data, err := os.ReadFile(authPath); err == nil && len(data) > 100 {
-		result["auth_json_written"] = true
+	// DRY RUN stops here (no message sending)
+	if isDryRun {
+		result["success"] = true
+		result["message"] = "DRY RUN complete. Restart Codex app and run _codex_send_msg.py to send message."
+		return jsonResponse(http.StatusOK, result)
 	}
+
+	// Step 2: _codex_send_msg.py (send message in Codex app)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Minute)
+	cmd2 := exec.CommandContext(ctx2, pyExe, sendScript, "--msg", "Say hello")
+	var stdout2 bytes.Buffer
+	cmd2.Stdout = &stdout2
+	cmd2.Stderr = &stderr2
+	err2 := cmd2.Run()
+	cancel2()
+	out2 := stdout2.String()
+	result["steps"].(map[string]any)["send_msg"] = map[string]any{
+		"stdout":  out2[:min(2000, len(out2))],
+		"success": err2 == nil,
+	}
+	if err2 != nil {
+		result["send_msg_error"] = err2.Error()
+	}
+
 	result["success"] = true
 	return jsonResponse(http.StatusOK, result)
 }
