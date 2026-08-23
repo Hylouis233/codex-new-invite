@@ -40,7 +40,7 @@ Fork of [LTbinglingfeng/cpa-plugin-codex-invite](https://github.com/LTbinglingfe
 | **Redeem reward** (`POST /codex-invite/redeem` → `/wham/rate-limit-reset-credits/consume`) | Actually applies a banked referral reward to restore your rate-limit window. |
 | **Manual credential mode** | Invite with an `access_token`/`account_id` you enter directly, for accounts not managed by CPA. In-memory only, never persisted. |
 | **Bilingual UI (EN / 中文)** | Both the Invite and Usage pages support English and Chinese, with locale auto-detection and persistence. |
-| **Usage page fixes** | Added management-key input, `X-Codex-Invite-Origin` header, GET→POST for fetch-body support, and account-status metrics on the referrals fallback path. |
+| **Usage page fixes** | Added a non-persistent management-key input, `X-Codex-Invite-Origin` header, safe text-node rendering for dynamic metrics, GET→POST for fetch-body support, and account-status metrics on the referrals fallback path. |
 
 ## How the Cloudflare bypass works
 
@@ -91,7 +91,7 @@ Deploy the built DLL to your CPA `plugins/<os>/<arch>/` directory (e.g. `plugins
 
 1. Open the CPA management center (`http://127.0.0.1:<port>/management.html`).
 2. Open **Codex Invite** or **Codex Usage** from the plugin menu.
-3. Enter your CPA management key (saved to localStorage for convenience).
+3. Enter your CPA management key. It remains only in the current page session and is not persisted to localStorage.
 4. Select a Codex credential, then query usage / send invites.
 
 ## License

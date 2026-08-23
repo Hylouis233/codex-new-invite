@@ -63,50 +63,50 @@ import (
 )
 
 const (
-	pluginID                      = "codex-invite"
-	defaultReferralKey            = "codex_referral_persistent_invite"
-	defaultBaseURL                = "https://chatgpt.com"
-	defaultLanguage               = "zh-CN"
-	defaultOriginator             = "Codex Desktop"
-	defaultUserAgent              = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
-	defaultMaxEmails              = 10
-	upperMaxEmails                = 50
-	maxManagementBodyBytes        = 1 << 20
-	managementAccountsPath        = "/v0/management/codex-invite/accounts"
-	managementInvitePath          = "/v0/management/codex-invite/invite"
-	managementUsagePath           = "/v0/management/codex-invite/usage"
-	managementReferralsPath       = "/v0/management/codex-invite/referrals"
-	managementProbePath           = "/v0/management/codex-invite/probe"
-	managementRedeemPath          = "/v0/management/codex-invite/redeem"
-	resourceInvitePath            = "/v0/resource/plugins/codex-invite/invite"
-	resourceUsagePath             = "/v0/resource/plugins/codex-invite/usage"
-	authFilesPath                 = "/v0/management/auth-files"
-	authFileDownloadPath          = "/v0/management/auth-files/download"
-	inviteEndpointPath            = "/backend-api/wham/referrals/invite"
+	pluginID                = "codex-invite"
+	defaultReferralKey      = "codex_referral_persistent_invite"
+	defaultBaseURL          = "https://chatgpt.com"
+	defaultLanguage         = "zh-CN"
+	defaultOriginator       = "Codex Desktop"
+	defaultUserAgent        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+	defaultMaxEmails        = 10
+	upperMaxEmails          = 50
+	maxManagementBodyBytes  = 1 << 20
+	managementAccountsPath  = "/v0/management/codex-invite/accounts"
+	managementInvitePath    = "/v0/management/codex-invite/invite"
+	managementUsagePath     = "/v0/management/codex-invite/usage"
+	managementReferralsPath = "/v0/management/codex-invite/referrals"
+	managementProbePath     = "/v0/management/codex-invite/probe"
+	managementRedeemPath    = "/v0/management/codex-invite/redeem"
+	resourceInvitePath      = "/v0/resource/plugins/codex-invite/invite"
+	resourceUsagePath       = "/v0/resource/plugins/codex-invite/usage"
+	authFilesPath           = "/v0/management/auth-files"
+	authFileDownloadPath    = "/v0/management/auth-files/download"
+	inviteEndpointPath      = "/backend-api/wham/referrals/invite"
 	// inviteEndpointPathV2 is the new referral invite endpoint used by the Codex desktop app.
 	// Body: {program_id, entrypoint, emails}. Reverse-engineered from app.asar.
-	inviteEndpointPathV2          = "/backend-api/referrals/invite"
-	usageEndpointPath             = "/backend-api/codex/usage"
-	referralsStatusEndpointPath   = "/backend-api/wham/referrals/status"
-	referralsCreditsEndpointPath  = "/backend-api/wham/referrals/credits"
+	inviteEndpointPathV2         = "/backend-api/referrals/invite"
+	usageEndpointPath            = "/backend-api/codex/usage"
+	referralsStatusEndpointPath  = "/backend-api/wham/referrals/status"
+	referralsCreditsEndpointPath = "/backend-api/wham/referrals/credits"
 	// resetCreditsEndpointPath lists banked rate-limit reset credits (referral-granted).
 	// Reverse-engineered from the openai.chatgpt VS Code extension webview bundle.
-	resetCreditsEndpointPath        = "/backend-api/wham/rate-limit-reset-credits"
+	resetCreditsEndpointPath = "/backend-api/wham/rate-limit-reset-credits"
 	// consumeCreditsEndpointPath redeems one banked reset credit. Body: {credit_id, redeem_request_id}.
-	consumeCreditsEndpointPath      = "/backend-api/wham/rate-limit-reset-credits/consume"
+	consumeCreditsEndpointPath = "/backend-api/wham/rate-limit-reset-credits/consume"
 	// inviteEligibilityEndpointPath probes invite eligibility. Reverse-engineered from
 	// the ChatGPT Codex desktop app (app.asar). Requires program_id + entrypoint query
 	// params; values depend on account type (consumer vs workspace) and trigger context.
-	inviteEligibilityEndpointPath   = "/backend-api/referrals/invite/eligibility"
+	inviteEligibilityEndpointPath = "/backend-api/referrals/invite/eligibility"
 	// inviteTrackingEndpointPath lists sent invite records. Reverse-engineered from the
 	// ChatGPT Codex desktop app.
-	inviteTrackingEndpointPath      = "/backend-api/referrals/invite/tracking"
+	inviteTrackingEndpointPath = "/backend-api/referrals/invite/tracking"
 	// programId values for the referral eligibility/tracking endpoints.
-	programIDConsumer               = "codex_referral_consumer"
-	programIDWorkspace              = "codex_referral_workspace"
+	programIDConsumer  = "codex_referral_consumer"
+	programIDWorkspace = "codex_referral_workspace"
 	// entrypoint values.
-	entrypointPersistent            = "persistent"
-	entrypointRateLimit             = "rate_limit"
+	entrypointPersistent          = "persistent"
+	entrypointRateLimit           = "rate_limit"
 	requestManagementOrigin       = "X-Codex-Invite-Origin"
 	contentTypeJSON               = "application/json; charset=utf-8"
 	contentTypeHTML               = "text/html; charset=utf-8"
@@ -289,14 +289,14 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(pluginRegistration())
 	case pluginabi.MethodManagementRegister:
 		return okEnvelope(managementRegistrationResponse{
-		Routes: []pluginapi.ManagementRoute{
-			{Method: http.MethodGet, Path: "/codex-invite/accounts"},
-			{Method: http.MethodPost, Path: "/codex-invite/invite"},
+			Routes: []pluginapi.ManagementRoute{
+				{Method: http.MethodGet, Path: "/codex-invite/accounts"},
+				{Method: http.MethodPost, Path: "/codex-invite/invite"},
 				{Method: http.MethodPost, Path: "/codex-invite/usage"},
 				{Method: http.MethodPost, Path: "/codex-invite/referrals"},
 				{Method: http.MethodPost, Path: "/codex-invite/probe"},
 				{Method: http.MethodPost, Path: "/codex-invite/redeem"},
-		},
+			},
 			Resources: []pluginapi.ResourceRoute{
 				{
 					Path:        "/invite",
@@ -630,13 +630,13 @@ func selectQueryAccount(req pluginapi.ManagementRequest, payload queryRequest) (
 
 // usageCredits captures the credit-balance section of GET /backend-api/codex/usage.
 type usageCredits struct {
-	Balance        float64 `json:"balance"`
-	HasSubscription bool   `json:"has_subscription,omitempty"`
+	Balance         float64 `json:"balance"`
+	HasSubscription bool    `json:"has_subscription,omitempty"`
 }
 
 // usageRateWindow captures one rate-limit window (primary or secondary).
 type usageRateWindow struct {
-	UsedPercent      float64 `json:"used_percent"`
+	UsedPercent       float64 `json:"used_percent"`
 	ResetAfterSeconds float64 `json:"reset_after_seconds,omitempty"`
 }
 
@@ -654,41 +654,41 @@ type usageResetCredits struct {
 
 // usageResponse is the structured view returned to the management center.
 type usageResponse struct {
-	OK                bool               `json:"ok"`
-	StatusCode        int                `json:"status_code"`
-	RequestID         string             `json:"request_id,omitempty"`
-	Account           accountInfo        `json:"account"`
-	Credits           *usageCredits      `json:"credits,omitempty"`
-	RateLimit         *usageRateLimit    `json:"rate_limit,omitempty"`
-	ResetCredits      *usageResetCredits `json:"rate_limit_reset_credits,omitempty"`
-	Upstream          any                `json:"upstream,omitempty"`
-	UpstreamRaw       string             `json:"upstream_raw,omitempty"`
+	OK           bool               `json:"ok"`
+	StatusCode   int                `json:"status_code"`
+	RequestID    string             `json:"request_id,omitempty"`
+	Account      accountInfo        `json:"account"`
+	Credits      *usageCredits      `json:"credits,omitempty"`
+	RateLimit    *usageRateLimit    `json:"rate_limit,omitempty"`
+	ResetCredits *usageResetCredits `json:"rate_limit_reset_credits,omitempty"`
+	Upstream     any                `json:"upstream,omitempty"`
+	UpstreamRaw  string             `json:"upstream_raw,omitempty"`
 }
 
 // referralsResponse is the structured view of remaining invite capacity.
 type referralsResponse struct {
-	OK                 bool        `json:"ok"`
-	Account            accountInfo `json:"account"`
-	RemainingInvites   any         `json:"remaining_invites,omitempty"`
-	MaxInvites         any         `json:"max_invites,omitempty"`
-	Status             any         `json:"status,omitempty"`
-	UsageEndpointUsed  bool        `json:"usage_endpoint_used,omitempty"`
-	StatusEndpointHit  bool        `json:"status_endpoint_hit,omitempty"`
-	StatusStatusCode   int         `json:"status_endpoint_status_code,omitempty"`
+	OK                bool        `json:"ok"`
+	Account           accountInfo `json:"account"`
+	RemainingInvites  any         `json:"remaining_invites,omitempty"`
+	MaxInvites        any         `json:"max_invites,omitempty"`
+	Status            any         `json:"status,omitempty"`
+	UsageEndpointUsed bool        `json:"usage_endpoint_used,omitempty"`
+	StatusEndpointHit bool        `json:"status_endpoint_hit,omitempty"`
+	StatusStatusCode  int         `json:"status_endpoint_status_code,omitempty"`
 	// Eligibility probe (GET /backend-api/referrals/invite/eligibility).
-	Eligibility        any         `json:"eligibility,omitempty"`
-	EligibilityHit     bool        `json:"eligibility_endpoint_hit,omitempty"`
-	EligibilityStatus  int         `json:"eligibility_status_code,omitempty"`
+	Eligibility       any  `json:"eligibility,omitempty"`
+	EligibilityHit    bool `json:"eligibility_endpoint_hit,omitempty"`
+	EligibilityStatus int  `json:"eligibility_status_code,omitempty"`
 	// Tracking probe (GET /backend-api/referrals/invite/tracking).
-	Tracking           any         `json:"tracking,omitempty"`
-	TrackingHit        bool        `json:"tracking_endpoint_hit,omitempty"`
-	TrackingCount      int         `json:"tracking_invite_count,omitempty"`
+	Tracking      any  `json:"tracking,omitempty"`
+	TrackingHit   bool `json:"tracking_endpoint_hit,omitempty"`
+	TrackingCount int  `json:"tracking_invite_count,omitempty"`
 	// Banked reset credits (GET /backend-api/wham/rate-limit-reset-credits).
-	ResetCredits       any         `json:"reset_credits,omitempty"`
-	ResetCreditsHit    bool        `json:"reset_credits_endpoint_hit,omitempty"`
-	Upstream           any         `json:"upstream,omitempty"`
-	UpstreamRaw        string      `json:"upstream_raw,omitempty"`
-	Note               string      `json:"note,omitempty"`
+	ResetCredits    any    `json:"reset_credits,omitempty"`
+	ResetCreditsHit bool   `json:"reset_credits_endpoint_hit,omitempty"`
+	Upstream        any    `json:"upstream,omitempty"`
+	UpstreamRaw     string `json:"upstream_raw,omitempty"`
+	Note            string `json:"note,omitempty"`
 }
 
 func handleUsage(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
@@ -953,12 +953,12 @@ func handleRedeem(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 	}
 
 	result := map[string]any{
-		"ok":               resp.StatusCode >= 200 && resp.StatusCode < 300,
-		"redeemed":         resp.StatusCode >= 200 && resp.StatusCode < 300,
-		"status_code":      resp.StatusCode,
-		"request_id":       resp.Header.Get("x-oai-request-id"),
-		"account":          account,
-		"credit_id":        creditID,
+		"ok":                resp.StatusCode >= 200 && resp.StatusCode < 300,
+		"redeemed":          resp.StatusCode >= 200 && resp.StatusCode < 300,
+		"status_code":       resp.StatusCode,
+		"request_id":        resp.Header.Get("x-oai-request-id"),
+		"account":           account,
+		"credit_id":         creditID,
 		"redeem_request_id": redeemReqID,
 	}
 	var upstream any
@@ -1738,10 +1738,10 @@ func fetchCodexUsage(ctx context.Context, cfg pluginConfig, credential codexCred
 		return usageResponse{}, errGet
 	}
 	result := usageResponse{
-		OK:          status >= 200 && status < 300,
-		StatusCode:  status,
-		RequestID:   requestID,
-		Account:     account,
+		OK:         status >= 200 && status < 300,
+		StatusCode: status,
+		RequestID:  requestID,
+		Account:    account,
 	}
 	if len(raw) == 0 {
 		return result, nil
@@ -2892,7 +2892,7 @@ func renderUsagePage(cfg pluginConfig) string {
     }
     .metric { display: grid; grid-template-columns: minmax(140px, 220px) 1fr; gap: 8px 16px; align-items: baseline; }
     .metric dt { font-size: 12px; font-weight: 650; opacity: .82; }
-    .metric dd { margin: 0; font-size: 14px; font-weight: 600; word-break: break-word; }
+    .metric dd { margin: 0; font-size: 14px; font-weight: 600; word-break: break-word; white-space: pre-wrap; }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 720; }
     .badge.ok { background: color-mix(in srgb, #10b981 22%, Canvas 78%); color: CanvasText; }
     .badge.warn { background: color-mix(in srgb, #b45309 22%, Canvas 78%); color: CanvasText; }
@@ -2962,7 +2962,6 @@ func renderUsagePage(cfg pluginConfig) string {
     const DEFAULTS = ` + "`" + string(rawDefaults) + "`" + `;
     const settings = Object.assign({ baseURL: 'https://chatgpt.com', language: 'zh-CN', originator: 'Codex Desktop', userAgent: '' }, DEFAULTS);
     const origin = (window.location && window.location.origin) || 'http://127.0.0.1:8317';
-    const MGMT_KEY_STORE = 'codex-usage-mgmt-key-v1';
     const LOCALE_STORE = 'codex-usage-locale-v1';
     const TRANSLATIONS = {
       en: {
@@ -3130,14 +3129,6 @@ func renderUsagePage(cfg pluginConfig) string {
     }
 
     const keyInput = document.getElementById('managementKey');
-    function storedManagementKey() {
-      try { return localStorage.getItem(MGMT_KEY_STORE) || ''; } catch { return ''; }
-    }
-    function persistManagementKey(value) {
-      try {
-        if (value) { localStorage.setItem(MGMT_KEY_STORE, value); } else { localStorage.removeItem(MGMT_KEY_STORE); }
-      } catch (error) { /* ignore storage failures */ }
-    }
     function authHeaders() {
       const raw = (keyInput && keyInput.value.trim()) || '';
       if (!raw) return {};
@@ -3155,6 +3146,13 @@ func renderUsagePage(cfg pluginConfig) string {
     const metrics = document.getElementById('metrics');
     const rawPre = document.getElementById('raw');
 
+    function setAccountPlaceholder(message) {
+      accountSelect.innerHTML = '';
+      const option = document.createElement('option');
+      option.textContent = String(message || '');
+      accountSelect.appendChild(option);
+    }
+
     async function readJSON(response) {
       const text = await response.text();
       try { return JSON.parse(text); } catch { return { raw: text }; }
@@ -3169,17 +3167,29 @@ func renderUsagePage(cfg pluginConfig) string {
       if (!Number.isFinite(n) || n <= 0) return '—';
       try { return new Date(n * 1000).toLocaleString(); } catch { return String(epochSec); }
     }
+    function badgeValue(text, cls) {
+      const allowedClass = cls === 'ok' || cls === 'warn' || cls === 'err' ? cls : '';
+      return { badgeText: String(text), badgeClass: allowedClass };
+    }
     function pctBadge(pct) {
       const n = Number(pct);
       if (!Number.isFinite(n)) return fmtNumber(pct);
       const cls = n >= 90 ? 'err' : n >= 70 ? 'warn' : 'ok';
-      return '<span class="badge ' + cls + '">' + n.toFixed(1) + '%</span>';
+      return badgeValue(n.toFixed(1) + '%', cls);
     }
     function setMetric(rows) {
       metrics.innerHTML = '';
       for (const [k, v] of rows) {
         const dt = document.createElement('dt'); dt.textContent = k;
-        const dd = document.createElement('dd'); dd.innerHTML = v;
+        const dd = document.createElement('dd');
+        if (v && typeof v === 'object' && Object.prototype.hasOwnProperty.call(v, 'badgeText')) {
+          const span = document.createElement('span');
+          span.className = 'badge' + (v.badgeClass ? ' ' + v.badgeClass : '');
+          span.textContent = v.badgeText;
+          dd.appendChild(span);
+        } else {
+          dd.textContent = v == null ? '' : String(v);
+        }
         metrics.appendChild(dt); metrics.appendChild(dd);
       }
     }
@@ -3204,9 +3214,9 @@ func renderUsagePage(cfg pluginConfig) string {
           opt.textContent = acc.email || acc.label || acc.name;
           accountSelect.appendChild(opt);
         }
-        if (!accountSelect.options.length) accountSelect.innerHTML = '<option>' + t('account.placeholderEmpty') + '</option>';
+        if (!accountSelect.options.length) setAccountPlaceholder(t('account.placeholderEmpty'));
       } catch (e) {
-        accountSelect.innerHTML = '<option>' + t('account.loadFailed', { error: (e.message || e) }) + '</option>';
+        setAccountPlaceholder(t('account.loadFailed', { error: String(e.message || e) }));
       } finally {
         reloadBtn.disabled = false;
       }
@@ -3252,7 +3262,7 @@ func renderUsagePage(cfg pluginConfig) string {
       const rl = d.rate_limit || {};
       const rc = d.rate_limit_reset_credits || {};
       rows.push([t('metric.account'), (d.account && (d.account.email || d.account.name)) || '—']);
-      rows.push([t('metric.httpStatus'), '<span class="badge ' + (d.ok ? 'ok' : 'err') + '">' + d.status_code + '</span>']);
+      rows.push([t('metric.httpStatus'), badgeValue(fmtNumber(d.status_code), d.ok ? 'ok' : 'err')]);
       rows.push([t('metric.creditBalance'), fmtNumber(c.balance)]);
       rows.push([t('metric.subscription'), c.has_subscription ? t('metric.subscriptionYes') : t('metric.subscriptionNo')]);
       if (rl.primary_window) {
@@ -3292,8 +3302,8 @@ func renderUsagePage(cfg pluginConfig) string {
       // Eligibility reward details (title, description, per-side grant amounts, rules).
       if (d.eligibility_endpoint_hit && d.eligibility && typeof d.eligibility === 'object') {
         const el = d.eligibility;
-        if (el.title) rows.push([t('metric.offerTitle'), '<strong>' + String(el.title) + '</strong>']);
-        if (el.description) rows.push([t('metric.offerDesc'), '<span style="white-space:pre-wrap">' + String(el.description) + '</span>']);
+        if (el.title) rows.push([t('metric.offerTitle'), String(el.title)]);
+        if (el.description) rows.push([t('metric.offerDesc'), String(el.description)]);
         if (Array.isArray(el.grants)) {
           for (const g of el.grants) {
             if (g.recipient === 'referrer') rows.push([t('metric.referrerReward'), fmtNumber(g.amount) + ' ' + (g.grant_type === 'personal_credits' ? t('metric.creditBalance').replace(/Balance|余额/, '').trim() : g.grant_type || '')]);
@@ -3301,7 +3311,7 @@ func renderUsagePage(cfg pluginConfig) string {
           }
         }
         if (Array.isArray(el.rules) && el.rules.length > 0) {
-          rows.push([t('metric.rules'), '<span style="white-space:pre-wrap">' + el.rules.map(r => '• ' + r).join('\n') + '</span>']);
+          rows.push([t('metric.rules'), el.rules.map(r => '• ' + String(r)).join('\n')]);
         }
       }
       // Banked reset-credits from the dedicated endpoint (/wham/rate-limit-reset-credits) —
@@ -3319,7 +3329,7 @@ func renderUsagePage(cfg pluginConfig) string {
         if (st.plan_type) rows.push([t('metric.planType'), String(st.plan_type)]);
         const rl = st.rate_limit || {};
         const limitReached = rl.limit_reached === true || (rl.primary_window && Number(rl.primary_window.used_percent) >= 100);
-        rows.push([t('metric.rateLimitStatus'), '<span class="badge ' + (limitReached ? 'err' : 'ok') + '">' + (limitReached ? t('metric.rateLimitExhausted') : t('metric.rateLimitActive')) + '</span>']);
+        rows.push([t('metric.rateLimitStatus'), badgeValue(limitReached ? t('metric.rateLimitExhausted') : t('metric.rateLimitActive'), limitReached ? 'err' : 'ok')]);
         const pw = rl.primary_window || {};
         if (pw.reset_at) rows.push([t('metric.rateLimitReset'), fmtEpoch(pw.reset_at)]);
         if (!d.reset_credits_endpoint_hit) {
@@ -3329,13 +3339,13 @@ func renderUsagePage(cfg pluginConfig) string {
         const cr = st.credits || {};
         if (typeof cr.has_credits === 'boolean') rows.push([t('metric.hasCredits'), cr.has_credits ? t('metric.subscriptionYes') : t('metric.subscriptionNo')]);
       }
-      if (d.note) rows.push([t('metric.note'), '<span style="white-space:pre-wrap">' + d.note + '</span>']);
+      if (d.note) rows.push([t('metric.note'), String(d.note)]);
       showResult(t('referrals.titleSuffix', { name: accountName(d) }), rows, d);
     }
 
     function guardKey(action) {
       if (!authHeaders().Authorization) {
-        accountSelect.innerHTML = '<option>' + t('account.placeholderKey') + '</option>';
+        setAccountPlaceholder(t('account.placeholderKey'));
         showResult(t('error.keyRequired'), [['message', t('error.keyRequiredMsg')]], { error: 'missing management key' });
         return;
       }
@@ -3382,13 +3392,8 @@ func renderUsagePage(cfg pluginConfig) string {
     refsBtn.addEventListener('click', () => guardKey(() => queryEndpoint('/v0/management/codex-invite/referrals', 'Referrals')));
     redeemBtn.addEventListener('click', () => guardKey(redeemReward));
     clearBtn.addEventListener('click', () => { resultPanel.hidden = true; metrics.innerHTML = ''; rawPre.textContent = ''; });
-    keyInput.addEventListener('input', () => persistManagementKey(keyInput.value.trim()));
-
     applyLocale();
-    // Restore a previously saved key and auto-load accounts only when present.
-    const savedKey = storedManagementKey();
-    if (savedKey) { keyInput.value = savedKey; loadAccounts(); }
-    else { accountSelect.innerHTML = '<option>' + t('account.placeholderKey') + '</option>'; }
+    setAccountPlaceholder(t('account.placeholderKey'));
   </script>
 </body>
 </html>`
