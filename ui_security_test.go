@@ -43,3 +43,27 @@ func TestUsagePageTreatsDynamicMetricsAsText(t *testing.T) {
 		}
 	}
 }
+
+func TestInvitePageRestrictsInviteLinksToHTTPS(t *testing.T) {
+	page := renderInvitePage(defaultConfig())
+	for _, required := range []string{
+		"function safeInviteURL(raw)",
+		"if (candidate.protocol !== 'https:') return '';",
+		"if (candidate.username || candidate.password) return '';",
+		"const inviteURL = safeInviteURL(invite.invite_url);",
+		"link.href = inviteURL;",
+		"link.rel = 'noopener noreferrer';",
+	} {
+		if !strings.Contains(page, required) {
+			t.Fatalf("invite page is missing safe URL marker %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"link.href = invite.invite_url;",
+		"link.rel = 'noreferrer';",
+	} {
+		if strings.Contains(page, forbidden) {
+			t.Fatalf("invite page still contains unsafe URL marker %q", forbidden)
+		}
+	}
+}

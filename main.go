@@ -2746,6 +2746,17 @@ func renderInvitePage(cfg pluginConfig) string {
       statusBox.className = 'status' + (error ? ' error' : '');
     }
 
+    function safeInviteURL(raw) {
+    try {
+      const candidate = new URL(String(raw || ''));
+      if (candidate.protocol !== 'https:') return '';
+      if (candidate.username || candidate.password) return '';
+      return candidate.href;
+    } catch (error) {
+      return '';
+    }
+  }
+
     function clearResult() {
       statusBox.hidden = true;
       statusBox.textContent = '';
@@ -2929,11 +2940,19 @@ func renderInvitePage(cfg pluginConfig) string {
         setStatus(JSON.stringify(data, null, 2), !ok);
         for (const invite of data.invites || []) {
           if (!invite.invite_url) continue;
+          const label = (invite.email || 'invite') + ': ' + invite.invite_url;
+          const inviteURL = safeInviteURL(invite.invite_url);
+          if (!inviteURL) {
+            const text = document.createElement('span');
+            text.textContent = label;
+            linksBox.appendChild(text);
+            continue;
+          }
           const link = document.createElement('a');
-          link.href = invite.invite_url;
+          link.href = inviteURL;
           link.target = '_blank';
-          link.rel = 'noreferrer';
-          link.textContent = (invite.email || 'invite') + ': ' + invite.invite_url;
+          link.rel = 'noopener noreferrer';
+          link.textContent = label;
           linksBox.appendChild(link);
         }
       } catch (error) {
