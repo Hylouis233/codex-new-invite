@@ -1,0 +1,71 @@
+name: Trigger current review fixes
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  fix:
+    if: github.event.issue.title == 'run-current-review-fix'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Extract and apply staged patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          source = Path('.github/workflows/apply-current-review-fixes.yml').read_text()
+          start_marker = "          python - <<'PY'\n"
+          end_marker = "\n          PY\n\n          gofmt -w"
+          start = source.find(start_marker)
+          if start < 0:
+              raise SystemExit('staged patch start marker not found')
+          start += len(start_marker)
+          end = source.find(end_marker, start)
+          if end < 0:
+              raise SystemExit('staged patch end marker not found')
+          lines = source[start:end].splitlines()
+          patch = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines) + '\n'
+          Path('/tmp/apply_review_fix.py').write_text(patch)
+          PY
+          python /tmp/apply_review_fix.py
+          gofmt -w main.go main_test.go security.go security_test.go host_security_test.go ui_security_test.go
+
+      - name: Verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./...
+          go vet ./...
+
+      - name: Commit verified fixes and remove one-shot workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/apply-current-review-fixes.yml .github/workflows/trigger-current-review-fixes.yml
+          git config user.name "Hylouis233"
+          git config user.email "88263959+Hylouis233@users.noreply.github.com"
+          git add main.go main_test.go README.md .github/workflows/apply-current-review-fixes.yml .github/workflows/trigger-current-review-fixes.yml
+          git commit -m "fix: address latest Codex review feedback"
+          git push origin HEAD:main
+
+      - name: Close trigger issue
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue close "${{ github.event.issue.number }}" --reason completed
