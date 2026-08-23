@@ -43,17 +43,8 @@ jobs:
           lines = source[start:end].splitlines()
           patch = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines) + '\n'
 
-          # The staged patch contains an HTML multiline literal whose visual
-          # indentation is stripped by YAML block-scalar parsing. Rewrite that
-          # one literal in the extracted Python so exact matching stays stable.
-          malformed = ''''''        <label>
-<span data-i18n="account.credential">Codex credential</span>
-<select id="account"></select>
-</label>''''''
-          intended = ''''''        <label>
-          <span data-i18n="account.credential">Codex credential</span>
-          <select id="account"></select>
-        </label>''''''
+          malformed = "        <label>\n<span data-i18n=\"account.credential\">Codex credential</span>\n<select id=\"account\"></select>\n</label>"
+          intended = "        <label>\n          <span data-i18n=\"account.credential\">Codex credential</span>\n          <select id=\"account\"></select>\n        </label>"
           patch = patch.replace(malformed, intended)
           Path('/tmp/apply_review_fix.py').write_text(patch)
           PY
