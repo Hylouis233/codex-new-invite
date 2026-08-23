@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 func TestCollectEmailsSplitsDedupesAndValidates(t *testing.T) {
@@ -118,7 +119,8 @@ func TestSendInviteUsesConfiguredProxy(t *testing.T) {
 		if req.Method != http.MethodPost {
 			t.Fatalf("proxied method = %q, want POST", req.Method)
 		}
-		wantURL := "http://chatgpt.example/backend-api/wham/referrals/invite"
+		// sendInvite tries the new V2 endpoint first (/backend-api/referrals/invite).
+		wantURL := "http://chatgpt.example/backend-api/referrals/invite"
 		if req.URL != wantURL {
 			t.Fatalf("proxied URL = %q, want %q", req.URL, wantURL)
 		}
@@ -128,7 +130,7 @@ func TestSendInviteUsesConfiguredProxy(t *testing.T) {
 		if req.ContentType != "application/json" {
 			t.Fatalf("content type = %q", req.ContentType)
 		}
-		if !strings.Contains(req.Body, `"referral_key":"ref-key"`) || !strings.Contains(req.Body, `"emails":["user@example.com"]`) {
+		if !strings.Contains(req.Body, `"program_id":"codex_referral_consumer"`) || !strings.Contains(req.Body, `"entrypoint":"persistent"`) || !strings.Contains(req.Body, `"emails":["user@example.com"]`) {
 			t.Fatalf("body = %q", req.Body)
 		}
 	case <-time.After(2 * time.Second):
@@ -249,11 +251,18 @@ func TestRegistrationUsesCustomPageInsteadOfConfigFields(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &registration); err != nil {
 		t.Fatalf("decode management registration: %v", err)
 	}
-	if len(registration.Resources) != 1 {
-		t.Fatalf("resources = %#v, want one custom page", registration.Resources)
+	if len(registration.Resources) != 2 {
+		t.Fatalf("resources = %#v, want two custom pages (invite + usage)", registration.Resources)
 	}
-	if got := registration.Resources[0]; got.Path != "/invite" || got.Menu != "Codex Invite" {
-		t.Fatalf("resource = %#v, want /invite Codex Invite", got)
+	resByPath := map[string]pluginapi.ResourceRoute{}
+	for _, res := range registration.Resources {
+		resByPath[res.Path] = res
+	}
+	if got, ok := resByPath["/invite"]; !ok || got.Menu != "Codex Invite" {
+		t.Fatalf("invite resource = %#v, want /invite Codex Invite", resByPath["/invite"])
+	}
+	if got, ok := resByPath["/usage"]; !ok || got.Menu != "Codex Usage" {
+		t.Fatalf("usage resource = %#v, want /usage Codex Usage", resByPath["/usage"])
 	}
 
 	routes := map[string]bool{}
@@ -263,9 +272,31 @@ func TestRegistrationUsesCustomPageInsteadOfConfigFields(t *testing.T) {
 	for _, want := range []string{
 		http.MethodGet + " /codex-invite/accounts",
 		http.MethodPost + " /codex-invite/invite",
+		http.MethodPost + " /codex-invite/usage",
+		http.MethodPost + " /codex-invite/referrals",
+		http.MethodPost + " /codex-invite/probe",
+		http.MethodPost + " /codex-invite/redeem",
 	} {
 		if !routes[want] {
 			t.Fatalf("registered routes = %#v, missing %s", registration.Routes, want)
 		}
+	}
+}
+
+func TestResolveManualCredential(t *testing.T) {
+	// Empty access_token -> manual mode off.
+	if _, _, manual := resolveManualCredential("", "acct-1", "a@example.com"); manual {
+		t.Fatalf("manual mode should be off when access_token is empty")
+	}
+	// Present access_token -> manual mode on, credential populated.
+	cred, acc, manual := resolveManualCredential("token-abc", "acct-1", "a@example.com")
+	if !manual {
+		t.Fatalf("manual mode should be on when access_token is present")
+	}
+	if cred.AccessToken != "token-abc" || cred.AccountID != "acct-1" || cred.Email != "a@example.com" {
+		t.Fatalf("credential = %#v", cred)
+	}
+	if acc.Source != "manual" {
+		t.Fatalf("account source = %q, want manual", acc.Source)
 	}
 }
