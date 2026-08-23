@@ -23,25 +23,12 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Extract and apply staged patch
+      - name: Extract and apply staged non-UI patch
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
-
-          # The staged patch's one HTML multiline old-value was authored inside a
-          # YAML heredoc and therefore expects its continuation lines without
-          # visual indentation. Normalize the checked-out source to that exact
-          # representation before applying the patch; the patch immediately
-          # replaces this block with the new Cookie-enabled markup.
-          main_path = Path('main.go')
-          main = main_path.read_text()
-          actual = "        <label>\n          <span data-i18n=\"account.credential\">Codex credential</span>\n          <select id=\"account\"></select>\n        </label>"
-          staged_old = "        <label>\n<span data-i18n=\"account.credential\">Codex credential</span>\n<select id=\"account\"></select>\n</label>"
-          if main.count(actual) != 1:
-              raise SystemExit(f'usage account block count = {main.count(actual)}, want 1')
-          main_path.write_text(main.replace(actual, staged_old, 1))
 
           source = Path('.github/workflows/apply-current-review-fixes.yml').read_text()
           start_marker = "          python - <<'PY'\n"
@@ -55,9 +42,103 @@ jobs:
               raise SystemExit('staged patch end marker not found')
           lines = source[start:end].splitlines()
           patch = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines) + '\n'
+
+          ui_start_marker = '# Usage-page Cookie plumbing and corrected reward-capacity rendering.'
+          ui_end_marker = '# Keep documentation aligned with the now-implemented referral credits probe.'
+          ui_start = patch.find(ui_start_marker)
+          ui_end = patch.find(ui_end_marker, ui_start)
+          if ui_start < 0 or ui_end < 0:
+              raise SystemExit('staged UI patch markers not found')
+          patch = patch[:ui_start] + patch[ui_end:]
           Path('/tmp/apply_review_fix.py').write_text(patch)
           PY
           python /tmp/apply_review_fix.py
+
+      - name: Apply usage-page UI patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('main.go')
+          text = path.read_text()
+
+          def replace_once(old, new, name):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{name}: expected 1 match, found {count}')
+              text = text.replace(old, new, 1)
+
+          account_block = '''        <label>
+          <span data-i18n="account.credential">Codex credential</span>
+          <select id="account"></select>
+        </label>'''
+          replace_once(
+              account_block,
+              account_block + '''
+        <label>
+          <span data-i18n="account.cookie">Browser Cookie (optional)</span>
+          <input id="cookie" type="password" autocomplete="off" spellcheck="false">
+        </label>''',
+              'cookie field',
+          )
+          replace_once(
+              "        'account.credential': 'Codex credential',",
+              "        'account.credential': 'Codex credential',\n        'account.cookie': 'Browser Cookie (optional)',",
+              'English cookie translation',
+          )
+          replace_once(
+              "        'account.credential': 'Codex 凭据',",
+              "        'account.credential': 'Codex 凭据',\n        'account.cookie': '浏览器 Cookie（可选）',",
+              'Chinese cookie translation',
+          )
+          replace_once(
+              "    const accountSelect = document.getElementById('account');",
+              "    const accountSelect = document.getElementById('account');\n    const cookieInput = document.getElementById('cookie');",
+              'cookie DOM binding',
+          )
+          replace_once(
+              '''          user_agent: settings.userAgent,
+          management_origin: origin''',
+              '''          user_agent: settings.userAgent,
+          cookie: cookieInput.value.trim(),
+          management_origin: origin''',
+              'query Cookie payload',
+          )
+          replace_once(
+              '''          auth_name: selected.dataset.name || '',
+          management_origin: origin''',
+              '''          auth_name: selected.dataset.name || '',
+          cookie: cookieInput.value.trim(),
+          management_origin: origin''',
+              'redeem Cookie payload',
+          )
+          replace_once(
+              '''      // Eligibility hit → remaining_reward_capacity is the "max rewards left" ceiling.
+      if (d.eligibility_endpoint_hit && d.max_invites != null) {
+        rows.push([t('metric.remainingReward'), fmtNumber(d.max_invites)]);
+      }''',
+              '''      if (d.eligibility_endpoint_hit && d.remaining_reward_capacity != null) {
+        rows.push([t('metric.remainingReward'), fmtNumber(d.remaining_reward_capacity)]);
+      }''',
+              'reward-capacity rendering',
+          )
+          replace_once(
+              '''      } else {
+        rows.push([t('metric.source'), d.status_endpoint_hit ? t('source.status') : t('source.credits')]);
+      }''',
+              '''      } else if (d.status_endpoint_hit) {
+        rows.push([t('metric.source'), t('source.status')]);
+      } else {
+        rows.push([t('metric.source'), d.referrals_credits_endpoint_hit ? t('source.credits') : t('source.usageFallback')]);
+      }''',
+              'referral source rendering',
+          )
+
+          path.write_text(text)
+          PY
           gofmt -w main.go main_test.go security.go security_test.go host_security_test.go ui_security_test.go
 
       - name: Verify
