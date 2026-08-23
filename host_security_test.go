@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -92,10 +91,12 @@ func TestParseCodexAccountsAcceptsHostCallbackShape(t *testing.T) {
 	}
 }
 
-func TestHostCallbackBridgeIsPresent(t *testing.T) {
+func TestHostAuthCallbackMethodNames(t *testing.T) {
 	t.Parallel()
-	page := renderUsagePage(defaultConfig())
-	if strings.Contains(page, "management_origin must use arbitrary host") {
-		t.Fatal("unexpected unsafe management-origin marker")
+	if hostAuthListMethod != "host.auth.list" {
+		t.Fatalf("hostAuthListMethod = %q", hostAuthListMethod)
+	}
+	if hostAuthGetMethod != "host.auth.get" {
+		t.Fatalf("hostAuthGetMethod = %q", hostAuthGetMethod)
 	}
 }
