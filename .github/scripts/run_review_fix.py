@@ -31,11 +31,17 @@ def extract_staged_patch() -> str:
 
     # The staged patch's generic string check also matches the legitimate
     # max_send_capacity assignment introduced by the same patch. Remove only
-    # that overbroad assertion entry; the targeted semantic tests remain.
+    # the assertion-list entry, identified by the immediately following list
+    # terminator; keep every replacement template and semantic test intact.
     patch_lines = patch.splitlines(keepends=True)
-    matches = [i for i, line in enumerate(patch_lines) if "result.MaxInvites = v" in line]
+    matches = [
+        i
+        for i, line in enumerate(patch_lines[:-1])
+        if "result.MaxInvites = v" in line
+        and patch_lines[i + 1].lstrip().startswith("]:")
+    ]
     if len(matches) != 1:
-        raise RuntimeError(f"overbroad MaxInvites guard matches = {len(matches)}, want 1")
+        raise RuntimeError(f"overbroad MaxInvites assertion matches = {len(matches)}, want 1")
     del patch_lines[matches[0]]
     return "".join(patch_lines)
 
