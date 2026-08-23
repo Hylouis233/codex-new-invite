@@ -1,20 +1,21 @@
 name: Trigger current review fixes
 
 on:
-  issues:
+  pull_request:
     types: [opened]
 
 permissions:
   contents: write
-  issues: write
+  pull-requests: write
 
 jobs:
   fix:
-    if: github.event.issue.title == 'run-current-review-fix'
+    if: github.event.pull_request.title == 'run-current-review-fix'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: main
           fetch-depth: 0
 
       - uses: actions/setup-go@v6
@@ -64,8 +65,8 @@ jobs:
           git commit -m "fix: address latest Codex review feedback"
           git push origin HEAD:main
 
-      - name: Close trigger issue
+      - name: Close trigger pull request
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh issue close "${{ github.event.issue.number }}" --reason completed
+        run: gh pr close "${{ github.event.pull_request.number }}"
