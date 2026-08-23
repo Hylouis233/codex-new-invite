@@ -27,7 +27,17 @@ def extract_staged_patch() -> str:
     ui_end = patch.find(ui_end_marker, ui_start)
     if ui_start < 0 or ui_end < 0:
         raise RuntimeError("staged UI patch markers not found")
-    return patch[:ui_start] + patch[ui_end:]
+    patch = patch[:ui_start] + patch[ui_end:]
+
+    # The staged patch's generic string check also matches the legitimate
+    # max_send_capacity assignment introduced by the same patch. Remove only
+    # that overbroad assertion entry; the targeted semantic tests remain.
+    patch_lines = patch.splitlines(keepends=True)
+    matches = [i for i, line in enumerate(patch_lines) if "result.MaxInvites = v" in line]
+    if len(matches) != 1:
+        raise RuntimeError(f"overbroad MaxInvites guard matches = {len(matches)}, want 1")
+    del patch_lines[matches[0]]
+    return "".join(patch_lines)
 
 
 def replace_once(text: str, old: str, new: str, name: str) -> str:
