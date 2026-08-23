@@ -229,8 +229,8 @@ jobs:
         with:
           name: ${{ env.ARCHIVE_NAME }}
           path: |
-            dist/${ARCHIVE_NAME}
-            dist/${ARCHIVE_NAME}.sha256
+            dist/${{ env.ARCHIVE_NAME }}
+            dist/${{ env.ARCHIVE_NAME }}.sha256
           if-no-files-found: error
 
   release:
