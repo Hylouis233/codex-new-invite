@@ -4,17 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"golang.org/x/net/http2"
 )
 
 func TestCollectEmailsSplitsDedupesAndValidates(t *testing.T) {
@@ -467,3 +471,263 @@ func TestRenderUsagePageIncludesNonPersistentCookieInput(t *testing.T) {
 		t.Fatal("usage page persists Cookie in localStorage")
 	}
 }
+
+func TestInvitePageRecomputesSendButtonOnManualTokenInput(t *testing.T) {
+	page := renderInvitePage(defaultConfig())
+	if !strings.Contains(page, `field('manualToken').addEventListener('input', updateEmailCount)`) {
+		t.Fatal("invite page does not recompute send-button state when the manual token changes")
+	}
+}
+
+func TestUsagePageRetriesRedeemWithPreservedIdentity(t *testing.T) {
+	page := renderUsagePage(defaultConfig())
+	for _, want := range []string{
+		`const redeemState = { credit_id: '', redeem_request_id: '' };`,
+		`if (redeemState.credit_id) payload.credit_id = redeemState.credit_id;`,
+		`if (data.credit_id) redeemState.credit_id = data.credit_id;`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("usage page missing redeem identity marker %q", want)
+		}
+	}
+}
+
+func TestHandleUsagePropagatesRejectedUpstreamStatus(t *testing.T) {
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+	}))
+	defer proxyServer.Close()
+
+	prev := currentConfig()
+	activeConfig.Store(pluginConfig{BaseURL: "http://chatgpt.example", Language: "en", Originator: "test", UserAgent: "test"})
+	t.Cleanup(func() { activeConfig.Store(prev) })
+
+	body, _ := json.Marshal(map[string]any{
+		"access_token": "token",
+		"proxy_url":    proxyServer.URL,
+	})
+	response := handleUsage(pluginapi.ManagementRequest{Body: body})
+	if response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("handleUsage status = %d, want 502", response.StatusCode)
+	}
+}
+
+func TestReferralCapacityPreservesEligibilityOverCreditsFallback(t *testing.T) {
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, inviteEligibilityEndpointPath):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"remaining_send_capacity":3,"remaining_reward_capacity":2,"max_send_capacity":5}`))
+		case r.URL.Path == referralsCreditsEndpointPath:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"available_count":99,"limit":1}`))
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer proxyServer.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result, err := fetchReferralCapacity(ctx, pluginConfig{BaseURL: "http://chatgpt.example"}, codexCredential{AccessToken: "token"}, accountInfo{}, "", proxyServer.URL)
+	if err != nil {
+		t.Fatalf("fetchReferralCapacity() error = %v", err)
+	}
+	if !result.EligibilityHit || !result.ReferralCreditsHit {
+		t.Fatalf("referral result = %#v", result)
+	}
+	if result.RemainingInvites != float64(3) || result.MaxInvites != float64(5) {
+		t.Fatalf("eligibility fields overwritten: %#v", result)
+	}
+}
+
+func TestProxyConnectAddrAddsDefaultPortsForIPv6(t *testing.T) {
+	httpURL, err := url.Parse("http://[::1]")
+	if err != nil {
+		t.Fatalf("parse http ipv6: %v", err)
+	}
+	if got := proxyConnectAddr(httpURL); got != "[::1]:80" {
+		t.Fatalf("http ipv6 proxy addr = %q, want [::1]:80", got)
+	}
+	httpsURL, err := url.Parse("https://[2001:db8::1]")
+	if err != nil {
+		t.Fatalf("parse https ipv6: %v", err)
+	}
+	if got := proxyConnectAddr(httpsURL); got != "[2001:db8::1]:443" {
+		t.Fatalf("https ipv6 proxy addr = %q, want [2001:db8::1]:443", got)
+	}
+	explicit, err := url.Parse("http://[::1]:8080")
+	if err != nil {
+		t.Fatalf("parse explicit ipv6: %v", err)
+	}
+	if got := proxyConnectAddr(explicit); got != "[::1]:8080" {
+		t.Fatalf("explicit ipv6 proxy addr = %q, want [::1]:8080", got)
+	}
+}
+
+func TestHTTP2StreamScopedErrorClassification(t *testing.T) {
+	if !isHTTP2StreamScopedError(context.Canceled) {
+		t.Fatal("canceled context should be stream-scoped")
+	}
+	if !isHTTP2StreamScopedError(context.DeadlineExceeded) {
+		t.Fatal("deadline exceeded should be stream-scoped")
+	}
+	if !isHTTP2StreamScopedError(http2.StreamError{StreamID: 1, Code: http2.ErrCodeCancel}) {
+		t.Fatal("http2.StreamError should be stream-scoped")
+	}
+	if isHTTP2StreamScopedError(http2.GoAwayError{ErrCode: http2.ErrCodeProtocol, DebugData: "bye"}) {
+		t.Fatal("GoAwayError should not be treated as stream-scoped")
+	}
+	if isHTTP2StreamScopedError(io.EOF) {
+		t.Fatal("EOF should not be treated as stream-scoped")
+	}
+}
+
+func TestUtlsRoundTripperCacheBoundsAndDrains(t *testing.T) {
+	drainUtlsRoundTripperCache()
+	t.Cleanup(drainUtlsRoundTripperCache)
+	dialer := &net.Dialer{}
+	first := cachedUtlsRoundTripper(dialer, "proxy-0")
+	for i := 1; i <= maxUtlsRoundTripperCache; i++ {
+		_ = cachedUtlsRoundTripper(dialer, fmt.Sprintf("proxy-%d", i))
+	}
+	revived := cachedUtlsRoundTripper(dialer, "proxy-0")
+	if revived == first {
+		t.Fatal("evicted round tripper was reused")
+	}
+	drainUtlsRoundTripperCache()
+	utlsCacheMu.Lock()
+	n := len(utlsCacheSlots)
+	utlsCacheMu.Unlock()
+	if n != 0 {
+		t.Fatalf("cache size after drain = %d, want 0", n)
+	}
+}
+
+func TestResolveRedeemIDsReusesPendingIdentity(t *testing.T) {
+	const key = "acct:reuse-test"
+	t.Cleanup(func() { clearPendingRedemption(key) })
+	rememberPendingRedemption(key, "credit-1", "req-1")
+	creditID, redeemID := resolveRedeemIDs(key, "", "")
+	if creditID != "credit-1" || redeemID != "req-1" {
+		t.Fatalf("resolveRedeemIDs() = %q %q, want credit-1 req-1", creditID, redeemID)
+	}
+	creditID, redeemID = resolveRedeemIDs(key, "credit-1", "")
+	if creditID != "credit-1" || redeemID != "req-1" {
+		t.Fatalf("same-credit retry = %q %q, want preserved request id", creditID, redeemID)
+	}
+	creditID, redeemID = resolveRedeemIDs(key, "credit-2", "")
+	if creditID != "credit-2" || redeemID == "req-1" || redeemID == "" {
+		t.Fatalf("different credit should get a new request id, got %q %q", creditID, redeemID)
+	}
+}
+
+func TestRedeemReusesIdentityAfterAmbiguousConsume(t *testing.T) {
+	var mu sync.Mutex
+	var consumeBodies []string
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case resetCreditsEndpointPath:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"credits":[{"id":"credit-1","status":"available"},{"id":"credit-2","status":"available"}],"available_count":2}`))
+		case consumeCreditsEndpointPath:
+			raw, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			consumeBodies = append(consumeBodies, string(raw))
+			n := len(consumeBodies)
+			mu.Unlock()
+			if n == 1 {
+				hj, ok := w.(http.Hijacker)
+				if !ok {
+					t.Fatal("response writer cannot hijack")
+				}
+				conn, _, err := hj.Hijack()
+				if err != nil {
+					t.Fatalf("hijack: %v", err)
+				}
+				_ = conn.Close()
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true,"windows_reset":1}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer proxyServer.Close()
+
+	prev := currentConfig()
+	activeConfig.Store(pluginConfig{BaseURL: "http://chatgpt.example", Language: "en", Originator: "test", UserAgent: "test"})
+	t.Cleanup(func() {
+		activeConfig.Store(prev)
+		clearPendingRedemption(redemptionAccountKey(accountInfo{}, codexCredential{AccountID: "acct-ambiguous"}))
+	})
+
+	body, _ := json.Marshal(map[string]any{
+		"access_token": "token",
+		"account_id":   "acct-ambiguous",
+		"proxy_url":    proxyServer.URL,
+	})
+	first := handleRedeem(pluginapi.ManagementRequest{Body: body})
+	if first.StatusCode == http.StatusOK {
+		t.Fatalf("first redeem unexpectedly succeeded: %+v", first)
+	}
+	var firstPayload map[string]any
+	if err := json.Unmarshal(first.Body, &firstPayload); err != nil {
+		t.Fatalf("decode first redeem: %v", err)
+	}
+	if firstPayload["credit_id"] != "credit-1" || firstPayload["redeem_request_id"] == "" {
+		t.Fatalf("ambiguous redeem missing identity: %#v", firstPayload)
+	}
+
+	second := handleRedeem(pluginapi.ManagementRequest{Body: body})
+	if second.StatusCode != http.StatusOK {
+		t.Fatalf("retry status = %d body=%s", second.StatusCode, second.Body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(consumeBodies) != 2 {
+		t.Fatalf("consume requests = %d, want 2; bodies=%v", len(consumeBodies), consumeBodies)
+	}
+	if consumeBodies[0] != consumeBodies[1] {
+		t.Fatalf("retry consumed a different identity: %v", consumeBodies)
+	}
+	if !strings.Contains(consumeBodies[0], `"credit_id":"credit-1"`) {
+		t.Fatalf("consume body = %s, want credit-1", consumeBodies[0])
+	}
+}
+
+func TestRedeemHonorsCallerSuppliedIdentity(t *testing.T) {
+	var consumeBody string
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == consumeCreditsEndpointPath {
+			raw, _ := io.ReadAll(r.Body)
+			consumeBody = string(raw)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer proxyServer.Close()
+
+	prev := currentConfig()
+	activeConfig.Store(pluginConfig{BaseURL: "http://chatgpt.example", Language: "en", Originator: "test", UserAgent: "test"})
+	t.Cleanup(func() { activeConfig.Store(prev) })
+
+	body, _ := json.Marshal(map[string]any{
+		"access_token":      "token",
+		"account_id":        "acct-supplied",
+		"proxy_url":         proxyServer.URL,
+		"credit_id":         "credit-9",
+		"redeem_request_id": "req-9",
+	})
+	response := handleRedeem(pluginapi.ManagementRequest{Body: body})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.StatusCode, response.Body)
+	}
+	if !strings.Contains(consumeBody, `"credit_id":"credit-9"`) || !strings.Contains(consumeBody, `"redeem_request_id":"req-9"`) {
+		t.Fatalf("consume body = %s", consumeBody)
+	}
+}
+

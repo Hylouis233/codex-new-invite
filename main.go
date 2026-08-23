@@ -306,6 +306,7 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
+	drainUtlsRoundTripperCache()
 	C.store_host_api(nil)
 }
 
@@ -623,6 +624,10 @@ type queryRequest struct {
 	AccessToken string `json:"access_token,omitempty"`
 	AccountID   string `json:"account_id,omitempty"`
 	ManualEmail string `json:"manual_email,omitempty"`
+	// CreditID and RedeemRequestID let a caller retry an ambiguous credit-consume
+	// without selecting a second banked credit.
+	CreditID        string `json:"credit_id,omitempty"`
+	RedeemRequestID string `json:"redeem_request_id,omitempty"`
 }
 
 // parseQueryRequest decodes a query request body, tolerant of empty bodies so a plain
@@ -801,6 +806,9 @@ func handleUsage(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	if errQuery != nil {
 		return jsonResponse(statusForError(errQuery), map[string]any{"error": errQuery.Error()})
 	}
+	if !result.OK {
+		return jsonResponse(http.StatusBadGateway, result)
+	}
 	return jsonResponse(http.StatusOK, result)
 }
 
@@ -968,46 +976,47 @@ func handleRedeem(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// 1. List banked credits to find an available one.
-	listStatus, _, listRaw, errList := codexGet(ctx, cfg, credential, resetCreditsEndpointPath, strings.TrimSpace(payload.Cookie), strings.TrimSpace(payload.ProxyURL))
-	if errList != nil {
-		return jsonResponse(statusForError(errList), map[string]any{"error": errList.Error()})
-	}
-	if listStatus != http.StatusOK {
-		return jsonResponse(http.StatusBadGateway, map[string]any{"error": fmt.Sprintf("failed to list reset credits: status %d", listStatus)})
-	}
+	accountKey := redemptionAccountKey(account, credential)
+	creditID, redeemReqID := resolveRedeemIDs(accountKey, payload.CreditID, payload.RedeemRequestID)
 
-	var creditsPayload struct {
-		Credits        []map[string]any `json:"credits"`
-		AvailableCount int              `json:"available_count"`
-	}
-	if errParse := json.Unmarshal(listRaw, &creditsPayload); errParse != nil {
-		return jsonResponse(http.StatusBadGateway, map[string]any{"error": "failed to parse reset credits response"})
-	}
+	if creditID == "" {
+		listStatus, _, listRaw, errList := codexGet(ctx, cfg, credential, resetCreditsEndpointPath, strings.TrimSpace(payload.Cookie), strings.TrimSpace(payload.ProxyURL))
+		if errList != nil {
+			return jsonResponse(statusForError(errList), map[string]any{"error": errList.Error()})
+		}
+		if listStatus != http.StatusOK {
+			return jsonResponse(http.StatusBadGateway, map[string]any{"error": fmt.Sprintf("failed to list reset credits: status %d", listStatus)})
+		}
 
-	// Find the first available credit.
-	var creditID string
-	for _, c := range creditsPayload.Credits {
-		status, _ := c["status"].(string)
-		if strings.EqualFold(status, "available") {
-			if id, ok := c["id"].(string); ok && id != "" {
-				creditID = id
-				break
+		var creditsPayload struct {
+			Credits        []map[string]any `json:"credits"`
+			AvailableCount int              `json:"available_count"`
+		}
+		if errParse := json.Unmarshal(listRaw, &creditsPayload); errParse != nil {
+			return jsonResponse(http.StatusBadGateway, map[string]any{"error": "failed to parse reset credits response"})
+		}
+
+		for _, c := range creditsPayload.Credits {
+			status, _ := c["status"].(string)
+			if strings.EqualFold(status, "available") {
+				if id, ok := c["id"].(string); ok && id != "" {
+					creditID = id
+					break
+				}
 			}
 		}
-	}
-	if creditID == "" {
-		return jsonResponse(http.StatusOK, map[string]any{
-			"ok":              false,
-			"redeemed":        false,
-			"account":         account,
-			"available_count": creditsPayload.AvailableCount,
-			"message":         "没有可用的重置额度（available credits = 0）。需要先通过邀请获得奖励后才能兑换。",
-		})
+		if creditID == "" {
+			clearPendingRedemption(accountKey)
+			return jsonResponse(http.StatusOK, map[string]any{
+				"ok":              false,
+				"redeemed":        false,
+				"account":         account,
+				"available_count": creditsPayload.AvailableCount,
+				"message":         "没有可用的重置额度（available credits = 0）。需要先通过邀请获得奖励后才能兑换。",
+			})
+		}
 	}
 
-	// 2. Consume the credit.
-	redeemReqID := newUUIDv4()
 	consumeEndpoint, errEndpoint := codexEndpoint(cfg.BaseURL, consumeCreditsEndpointPath)
 	if errEndpoint != nil {
 		return jsonResponse(http.StatusInternalServerError, map[string]any{"error": errEndpoint.Error()})
@@ -1040,14 +1049,29 @@ func handleRedeem(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 	if errClient != nil {
 		return jsonResponse(http.StatusInternalServerError, map[string]any{"error": errClient.Error()})
 	}
+	identity := map[string]any{
+		"account":           account,
+		"credit_id":         creditID,
+		"redeem_request_id": redeemReqID,
+	}
 	resp, errDo := client.Do(req2)
 	if errDo != nil {
-		return jsonResponse(statusForError(errDo), map[string]any{"error": errDo.Error()})
+		rememberPendingRedemption(accountKey, creditID, redeemReqID)
+		identity["ok"] = false
+		identity["redeemed"] = false
+		identity["error"] = errDo.Error()
+		return jsonResponse(statusForError(errDo), identity)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	consumeRaw, errRead := readLimited(resp.Body, upstreamBodyLimit)
 	if errRead != nil {
-		return jsonResponse(http.StatusBadGateway, map[string]any{"error": errRead.Error()})
+		rememberPendingRedemption(accountKey, creditID, redeemReqID)
+		identity["ok"] = false
+		identity["redeemed"] = false
+		identity["status_code"] = resp.StatusCode
+		identity["request_id"] = resp.Header.Get("x-oai-request-id")
+		identity["error"] = errRead.Error()
+		return jsonResponse(http.StatusBadGateway, identity)
 	}
 
 	succeeded := resp.StatusCode >= 200 && resp.StatusCode < 300
@@ -1067,9 +1091,11 @@ func handleRedeem(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 		result["upstream_raw"] = string(consumeRaw)
 	}
 	if !succeeded {
+		clearPendingRedemption(accountKey)
 		result["error"] = fmt.Sprintf("reset credit consume rejected: status %d", resp.StatusCode)
 		return jsonResponse(http.StatusBadGateway, result)
 	}
+	clearPendingRedemption(accountKey)
 	return jsonResponse(http.StatusOK, result)
 }
 
@@ -1080,6 +1106,72 @@ func newUUIDv4() string {
 	b[6] = (b[6] & 0x0f) | 0x40 // version 4
 	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+type pendingRedemption struct {
+	CreditID        string
+	RedeemRequestID string
+}
+
+var (
+	pendingRedemptionMu sync.Mutex
+	pendingRedemptions  = map[string]pendingRedemption{}
+)
+
+func redemptionAccountKey(account accountInfo, credential codexCredential) string {
+	switch {
+	case strings.TrimSpace(account.AuthIndex) != "":
+		return "auth:" + strings.TrimSpace(account.AuthIndex)
+	case strings.TrimSpace(credential.AccountID) != "":
+		return "acct:" + strings.TrimSpace(credential.AccountID)
+	case strings.TrimSpace(account.Name) != "":
+		return "name:" + strings.TrimSpace(account.Name)
+	case strings.TrimSpace(credential.Email) != "":
+		return "email:" + strings.TrimSpace(credential.Email)
+	default:
+		return "manual"
+	}
+}
+
+func pendingRedemptionFor(accountKey string) (pendingRedemption, bool) {
+	pendingRedemptionMu.Lock()
+	defer pendingRedemptionMu.Unlock()
+	pending, ok := pendingRedemptions[accountKey]
+	return pending, ok
+}
+
+func rememberPendingRedemption(accountKey, creditID, redeemRequestID string) {
+	creditID = strings.TrimSpace(creditID)
+	redeemRequestID = strings.TrimSpace(redeemRequestID)
+	if accountKey == "" || creditID == "" || redeemRequestID == "" {
+		return
+	}
+	pendingRedemptionMu.Lock()
+	pendingRedemptions[accountKey] = pendingRedemption{CreditID: creditID, RedeemRequestID: redeemRequestID}
+	pendingRedemptionMu.Unlock()
+}
+
+func clearPendingRedemption(accountKey string) {
+	pendingRedemptionMu.Lock()
+	delete(pendingRedemptions, accountKey)
+	pendingRedemptionMu.Unlock()
+}
+
+func resolveRedeemIDs(accountKey, creditID, redeemRequestID string) (string, string) {
+	creditID = strings.TrimSpace(creditID)
+	redeemRequestID = strings.TrimSpace(redeemRequestID)
+	if pending, ok := pendingRedemptionFor(accountKey); ok {
+		if creditID == "" {
+			creditID = pending.CreditID
+		}
+		if redeemRequestID == "" && creditID == pending.CreditID {
+			redeemRequestID = pending.RedeemRequestID
+		}
+	}
+	if redeemRequestID == "" {
+		redeemRequestID = newUUIDv4()
+	}
+	return creditID, redeemRequestID
 }
 
 type httpStatusError struct {
@@ -1711,6 +1803,9 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 
 	resp, errTrip := h2Conn.RoundTrip(req)
 	if errTrip != nil {
+		if isHTTP2StreamScopedError(errTrip) {
+			return nil, errTrip
+		}
 		removed := false
 		t.mu.Lock()
 		if cached, ok := t.connections[hostname]; ok && cached == h2Conn {
@@ -1727,17 +1822,75 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	return resp, nil
 }
 
-// utlsRoundTripperCache reuses one Chrome round tripper per proxy URL so repeated
-// queries share the HTTP/2 connection instead of re-handshaking on every call.
-var utlsRoundTripperCache sync.Map
+func isHTTP2StreamScopedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var streamErr http2.StreamError
+	return errors.As(err, &streamErr)
+}
+
+func (t *utlsRoundTripper) Close() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	conns := t.connections
+	t.connections = make(map[string]*http2.ClientConn)
+	t.mu.Unlock()
+	for _, conn := range conns {
+		if conn != nil {
+			_ = conn.Close()
+		}
+	}
+}
+
+const maxUtlsRoundTripperCache = 8
+
+type utlsCacheSlot struct {
+	key string
+	rt  *utlsRoundTripper
+}
+
+var (
+	utlsCacheMu    sync.Mutex
+	utlsCacheSlots []*utlsCacheSlot
+)
 
 func cachedUtlsRoundTripper(dialer proxy.Dialer, cacheKey string) *utlsRoundTripper {
-	if existing, ok := utlsRoundTripperCache.Load(cacheKey); ok {
-		return existing.(*utlsRoundTripper)
+	utlsCacheMu.Lock()
+	defer utlsCacheMu.Unlock()
+	for i, slot := range utlsCacheSlots {
+		if slot.key == cacheKey {
+			if i != len(utlsCacheSlots)-1 {
+				utlsCacheSlots = append(append(utlsCacheSlots[:i], utlsCacheSlots[i+1:]...), slot)
+			}
+			return slot.rt
+		}
 	}
 	rt := newUtlsRoundTripper(dialer)
-	actual, _ := utlsRoundTripperCache.LoadOrStore(cacheKey, rt)
-	return actual.(*utlsRoundTripper)
+	utlsCacheSlots = append(utlsCacheSlots, &utlsCacheSlot{key: cacheKey, rt: rt})
+	for len(utlsCacheSlots) > maxUtlsRoundTripperCache {
+		evicted := utlsCacheSlots[0]
+		utlsCacheSlots = utlsCacheSlots[1:]
+		evicted.rt.Close()
+	}
+	return rt
+}
+
+func drainUtlsRoundTripperCache() {
+	utlsCacheMu.Lock()
+	slots := utlsCacheSlots
+	utlsCacheSlots = nil
+	utlsCacheMu.Unlock()
+	for _, slot := range slots {
+		if slot != nil && slot.rt != nil {
+			slot.rt.Close()
+		}
+	}
 }
 
 // chatGPTFingerprintTransport routes chatgpt.com requests through the Chrome
@@ -1821,15 +1974,21 @@ func proxyTLSConfig(host string) *stdtls.Config {
 	}
 }
 
-func (d *httpConnectDialer) dialConnect(ctx context.Context, _, addr string) (net.Conn, error) {
-	proxyAddr := d.proxyURL.Host
-	if !strings.Contains(proxyAddr, ":") {
-		if strings.EqualFold(d.proxyURL.Scheme, "https") {
-			proxyAddr = net.JoinHostPort(proxyAddr, "443")
+func proxyConnectAddr(proxyURL *url.URL) string {
+	host := proxyURL.Hostname()
+	port := proxyURL.Port()
+	if port == "" {
+		if strings.EqualFold(proxyURL.Scheme, "https") {
+			port = "443"
 		} else {
-			proxyAddr = net.JoinHostPort(proxyAddr, "80")
+			port = "80"
 		}
 	}
+	return net.JoinHostPort(host, port)
+}
+
+func (d *httpConnectDialer) dialConnect(ctx context.Context, _, addr string) (net.Conn, error) {
+	proxyAddr := proxyConnectAddr(d.proxyURL)
 
 	netDialer := &net.Dialer{Timeout: 15 * time.Second}
 	rawConn, errDial := netDialer.DialContext(ctx, "tcp", proxyAddr)
@@ -2168,7 +2327,9 @@ func fetchReferralCapacity(ctx context.Context, cfg pluginConfig, credential cod
 	result.StatusStatusCode = status.statusCode
 	if status.hit {
 		result.StatusEndpointHit = true
-		liftReferralFields(&result, status.raw, "status")
+		if !result.EligibilityHit {
+			liftReferralFields(&result, status.raw, "status")
+		}
 	}
 
 	credits := probe(referralsCreditsEndpointPath)
@@ -2177,7 +2338,9 @@ func fetchReferralCapacity(ctx context.Context, cfg pluginConfig, credential cod
 	result.ReferralCreditsHit = credits.hit
 	if credits.hit {
 		result.ReferralCredits = jsonRawMessage(credits.raw)
-		liftReferralFields(&result, credits.raw, "credits")
+		if !result.EligibilityHit {
+			liftReferralFields(&result, credits.raw, "credits")
+		}
 	}
 
 	if !result.EligibilityHit && !status.hit && !credits.hit {
@@ -3154,6 +3317,7 @@ func renderInvitePage(cfg pluginConfig) string {
     sendButton.addEventListener('click', sendInvites);
     clearResultButton.addEventListener('click', clearResult);
     field('emails').addEventListener('input', updateEmailCount);
+    field('manualToken').addEventListener('input', updateEmailCount);
     accountSelect.addEventListener('change', updateEmailCount);
     renderAccounts([]);
     applyLocale();
@@ -3478,6 +3642,7 @@ func renderUsagePage(cfg pluginConfig) string {
     const resultTitle = document.getElementById('resultTitle');
     const metrics = document.getElementById('metrics');
     const rawPre = document.getElementById('raw');
+    const redeemState = { credit_id: '', redeem_request_id: '' };
 
     function setAccountPlaceholder(message) {
       accountSelect.innerHTML = '';
@@ -3698,14 +3863,20 @@ func renderUsagePage(cfg pluginConfig) string {
           cookie: cookieInput.value.trim(),
           management_origin: origin
         };
+        if (redeemState.credit_id) payload.credit_id = redeemState.credit_id;
+        if (redeemState.redeem_request_id) payload.redeem_request_id = redeemState.redeem_request_id;
         const response = await fetch('/v0/management/codex-invite/redeem', {
           method: 'POST',
           headers: Object.assign({}, authHeaders(), { 'Content-Type': 'application/json' }),
           body: JSON.stringify(payload)
         });
         const data = await readJSON(response);
+        if (data.credit_id) redeemState.credit_id = data.credit_id;
+        if (data.redeem_request_id) redeemState.redeem_request_id = data.redeem_request_id;
         if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
         if (data.redeemed) {
+          redeemState.credit_id = '';
+          redeemState.redeem_request_id = '';
           const ws = data.upstream ? (data.upstream.windows_reset || '?') : '?';
           showResult(t('redeem.success', { count: ws }), [
             ['redeemed', data.redeemed ? '✅' : '❌'],
