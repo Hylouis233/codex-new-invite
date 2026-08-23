@@ -58,7 +58,7 @@ func TestInviteRequestRejectsCredentialExfiltrationBaseURL(t *testing.T) {
 	t.Parallel()
 
 	var request inviteRequest
-	err := json.Unmarshal([]byte(`{"access_token":"secret","base_url":"https://evil.example"}`), &request)
+	err := json.Unmarshal([]byte("{\"access_token\":\"secret\",\"base_url\":\"https://evil.example\"}"), &request)
 	if err == nil {
 		t.Fatal("invite request with a non-ChatGPT base_url unexpectedly succeeded")
 	}
@@ -71,7 +71,7 @@ func TestQueryRequestRejectsCredentialExfiltrationBaseURL(t *testing.T) {
 	t.Parallel()
 
 	var request queryRequest
-	err := json.Unmarshal([]byte(`{"access_token":"secret","base_url":"https://evil.example"}`), &request)
+	err := json.Unmarshal([]byte("{\"access_token\":\"secret\",\"base_url\":\"https://evil.example\"}"), &request)
 	if err == nil {
 		t.Fatal("query request with a non-ChatGPT base_url unexpectedly succeeded")
 	}
@@ -84,7 +84,7 @@ func TestCredentialRequestsAcceptCanonicalChatGPTOrigin(t *testing.T) {
 	t.Parallel()
 
 	var invite inviteRequest
-	if err := json.Unmarshal([]byte(`{"access_token":"secret","base_url":"https://chatgpt.com/"}`), &invite); err != nil {
+	if err := json.Unmarshal([]byte("{\"access_token\":\"secret\",\"base_url\":\"https://chatgpt.com/\"}"), &invite); err != nil {
 		t.Fatalf("canonical invite base_url rejected: %v", err)
 	}
 	if invite.BaseURL != defaultBaseURL || invite.AccessToken != "secret" {
@@ -92,7 +92,7 @@ func TestCredentialRequestsAcceptCanonicalChatGPTOrigin(t *testing.T) {
 	}
 
 	var query queryRequest
-	if err := json.Unmarshal([]byte(`{"access_token":"secret","base_url":"https://chatgpt.com"}`), &query); err != nil {
+	if err := json.Unmarshal([]byte("{\"access_token\":\"secret\",\"base_url\":\"https://chatgpt.com\"}"), &query); err != nil {
 		t.Fatalf("canonical query base_url rejected: %v", err)
 	}
 	if query.BaseURL != defaultBaseURL || query.AccessToken != "secret" {
