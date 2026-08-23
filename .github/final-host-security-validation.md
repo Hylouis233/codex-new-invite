@@ -1,0 +1,1 @@
+Temporary same-repository trigger for the exact final host-callback, loopback fallback, origin pinning, and usage-UI security tree. The PR and branch will be deleted after all configured jobs complete.
