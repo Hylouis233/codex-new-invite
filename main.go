@@ -60,6 +60,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	stdtls "crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -196,14 +197,15 @@ type pluginConfig struct {
 }
 
 type accountInfo struct {
-	AuthIndex        string `json:"auth_index,omitempty"`
-	Name             string `json:"name"`
-	Label            string `json:"label,omitempty"`
-	Email            string `json:"email,omitempty"`
-	Account          string `json:"account,omitempty"`
-	ChatGPTAccountID string `json:"chatgpt_account_id,omitempty"`
-	Status           string `json:"status,omitempty"`
-	Source           string `json:"source,omitempty"`
+	AuthIndex         string `json:"auth_index,omitempty"`
+	Name              string `json:"name"`
+	Label             string `json:"label,omitempty"`
+	Email             string `json:"email,omitempty"`
+	Account           string `json:"account,omitempty"`
+	ChatGPTAccountID  string `json:"chatgpt_account_id,omitempty"`
+	Status            string `json:"status,omitempty"`
+	Source            string `json:"source,omitempty"`
+	ReferralProgramID string `json:"referral_program_id,omitempty"`
 }
 
 type accountsResponse struct {
@@ -625,12 +627,19 @@ type queryRequest struct {
 
 // parseQueryRequest decodes a query request body, tolerant of empty bodies so a plain
 // GET with no JSON still works (the account can be auto-selected when only one exists).
-func parseQueryRequest(body []byte) queryRequest {
+func parseQueryRequest(body []byte) (queryRequest, error) {
 	var payload queryRequest
-	if len(body) > 0 {
-		_ = json.Unmarshal(body, &payload)
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return payload, nil
 	}
-	return payload
+	if len(trimmed) > maxManagementBodyBytes {
+		return queryRequest{}, fmt.Errorf("request body is too large")
+	}
+	if errUnmarshal := json.Unmarshal(trimmed, &payload); errUnmarshal != nil {
+		return queryRequest{}, fmt.Errorf("invalid JSON request body: %w", errUnmarshal)
+	}
+	return payload, nil
 }
 
 // selectQueryAccount reuses the invite account lister and selector for query endpoints,
@@ -740,14 +749,15 @@ type usageResponse struct {
 
 // referralsResponse is the structured view of remaining invite capacity.
 type referralsResponse struct {
-	OK                bool        `json:"ok"`
-	Account           accountInfo `json:"account"`
-	RemainingInvites  any         `json:"remaining_invites,omitempty"`
-	MaxInvites        any         `json:"max_invites,omitempty"`
-	Status            any         `json:"status,omitempty"`
-	UsageEndpointUsed bool        `json:"usage_endpoint_used,omitempty"`
-	StatusEndpointHit bool        `json:"status_endpoint_hit,omitempty"`
-	StatusStatusCode  int         `json:"status_endpoint_status_code,omitempty"`
+	OK                      bool        `json:"ok"`
+	Account                 accountInfo `json:"account"`
+	RemainingInvites        any         `json:"remaining_invites,omitempty"`
+	MaxInvites              any         `json:"max_invites,omitempty"`
+	RemainingRewardCapacity any         `json:"remaining_reward_capacity,omitempty"`
+	Status                  any         `json:"status,omitempty"`
+	UsageEndpointUsed       bool        `json:"usage_endpoint_used,omitempty"`
+	StatusEndpointHit       bool        `json:"status_endpoint_hit,omitempty"`
+	StatusStatusCode        int         `json:"status_endpoint_status_code,omitempty"`
 	// Eligibility probe (GET /backend-api/referrals/invite/eligibility).
 	Eligibility       any  `json:"eligibility,omitempty"`
 	EligibilityHit    bool `json:"eligibility_endpoint_hit,omitempty"`
@@ -757,15 +767,21 @@ type referralsResponse struct {
 	TrackingHit   bool `json:"tracking_endpoint_hit,omitempty"`
 	TrackingCount int  `json:"tracking_invite_count,omitempty"`
 	// Banked reset credits (GET /backend-api/wham/rate-limit-reset-credits).
-	ResetCredits    any    `json:"reset_credits,omitempty"`
-	ResetCreditsHit bool   `json:"reset_credits_endpoint_hit,omitempty"`
-	Upstream        any    `json:"upstream,omitempty"`
-	UpstreamRaw     string `json:"upstream_raw,omitempty"`
-	Note            string `json:"note,omitempty"`
+	ResetCredits          any    `json:"reset_credits,omitempty"`
+	ResetCreditsHit       bool   `json:"reset_credits_endpoint_hit,omitempty"`
+	ReferralCredits       any    `json:"referrals_credits,omitempty"`
+	ReferralCreditsHit    bool   `json:"referrals_credits_endpoint_hit,omitempty"`
+	ReferralCreditsStatus int    `json:"referrals_credits_status_code,omitempty"`
+	Upstream              any    `json:"upstream,omitempty"`
+	UpstreamRaw           string `json:"upstream_raw,omitempty"`
+	Note                  string `json:"note,omitempty"`
 }
 
 func handleUsage(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	payload := parseQueryRequest(req.Body)
+	payload, errPayload := parseQueryRequest(req.Body)
+	if errPayload != nil {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": errPayload.Error()})
+	}
 
 	credential, account, errAccount := resolveQueryCredential(req, payload)
 	if errAccount != nil {
@@ -789,7 +805,10 @@ func handleUsage(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 }
 
 func handleReferrals(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	payload := parseQueryRequest(req.Body)
+	payload, errPayload := parseQueryRequest(req.Body)
+	if errPayload != nil {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": errPayload.Error()})
+	}
 
 	credential, account, errAccount := resolveQueryCredential(req, payload)
 	if errAccount != nil {
@@ -817,7 +836,10 @@ func handleReferrals(req pluginapi.ManagementRequest) pluginapi.ManagementRespon
 // returning status + a body preview for each. It exists to reverse-engineer
 // which (if any) endpoint exposes referral invite counts / credit rewards.
 func handleProbe(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	payload := parseQueryRequest(req.Body)
+	payload, errPayload := parseQueryRequest(req.Body)
+	if errPayload != nil {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": errPayload.Error()})
+	}
 
 	var endpoints []string
 	if len(req.Body) > 0 {
@@ -926,7 +948,10 @@ func handleProbe(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 // via POST /backend-api/wham/rate-limit-reset-redits/consume. This is the action that turns a
 // stored referral reward into actual rate-limit window resets.
 func handleRedeem(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	payload := parseQueryRequest(req.Body)
+	payload, errPayload := parseQueryRequest(req.Body)
+	if errPayload != nil {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": errPayload.Error()})
+	}
 
 	credential, account, errAccount := resolveQueryCredential(req, payload)
 	if errAccount != nil {
@@ -1025,9 +1050,10 @@ func handleRedeem(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 		return jsonResponse(http.StatusBadGateway, map[string]any{"error": errRead.Error()})
 	}
 
+	succeeded := resp.StatusCode >= 200 && resp.StatusCode < 300
 	result := map[string]any{
-		"ok":                resp.StatusCode >= 200 && resp.StatusCode < 300,
-		"redeemed":          resp.StatusCode >= 200 && resp.StatusCode < 300,
+		"ok":                succeeded,
+		"redeemed":          succeeded,
 		"status_code":       resp.StatusCode,
 		"request_id":        resp.Header.Get("x-oai-request-id"),
 		"account":           account,
@@ -1039,6 +1065,10 @@ func handleRedeem(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 		result["upstream"] = upstream
 	} else if len(consumeRaw) > 0 {
 		result["upstream_raw"] = string(consumeRaw)
+	}
+	if !succeeded {
+		result["error"] = fmt.Sprintf("reset credit consume rejected: status %d", resp.StatusCode)
+		return jsonResponse(http.StatusBadGateway, result)
 	}
 	return jsonResponse(http.StatusOK, result)
 }
@@ -1138,6 +1168,45 @@ func selectAccount(accounts []accountInfo, req inviteRequest) (accountInfo, erro
 	return accountInfo{}, fmt.Errorf("selected Codex credential was not found")
 }
 
+func referralProgramForAccount(account accountInfo) string {
+	if account.ReferralProgramID == programIDWorkspace {
+		return programIDWorkspace
+	}
+	for _, value := range []string{account.Account, account.Label, account.Source} {
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		if strings.Contains(normalized, "workspace") || normalized == "team" || normalized == "business" || normalized == "enterprise" {
+			return programIDWorkspace
+		}
+	}
+	return programIDConsumer
+}
+
+func inferReferralProgram(file map[string]any) string {
+	if boolValue(file["is_workspace"]) || boolValue(file["workspace"]) {
+		return programIDWorkspace
+	}
+	for _, path := range [][]string{
+		{"workspace_id"}, {"team_id"},
+		{"id_token", "workspace_id"}, {"id_token", "team_id"},
+	} {
+		if nestedString(file, path...) != "" {
+			return programIDWorkspace
+		}
+	}
+	for _, value := range []string{
+		firstString(file, "account_type", "plan_type", "chatgpt_plan_type", "workspace_type", "account"),
+		nestedString(file, "id_token", "account_type"),
+		nestedString(file, "id_token", "plan_type"),
+		nestedString(file, "id_token", "chatgpt_plan_type"),
+	} {
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		if strings.Contains(normalized, "workspace") || normalized == "team" || normalized == "business" || normalized == "enterprise" {
+			return programIDWorkspace
+		}
+	}
+	return programIDConsumer
+}
+
 func fetchCodexAccounts(req pluginapi.ManagementRequest, explicitOrigin string) ([]accountInfo, error) {
 	if raw, errHost := callHost(hostAuthListMethod, map[string]any{}); errHost == nil {
 		return parseCodexAccounts(raw)
@@ -1189,14 +1258,15 @@ func parseCodexAccounts(raw []byte) ([]accountInfo, error) {
 			continue
 		}
 		accounts = append(accounts, accountInfo{
-			AuthIndex:        firstString(file, "auth_index", "auth-index"),
-			Name:             name,
-			Label:            firstString(file, "label"),
-			Email:            firstString(file, "email"),
-			Account:          firstString(file, "account"),
-			ChatGPTAccountID: nestedString(file, "id_token", "chatgpt_account_id"),
-			Status:           firstString(file, "status"),
-			Source:           firstString(file, "source"),
+			AuthIndex:         firstString(file, "auth_index", "auth-index"),
+			Name:              name,
+			Label:             firstString(file, "label"),
+			Email:             firstString(file, "email"),
+			Account:           firstString(file, "account"),
+			ChatGPTAccountID:  nestedString(file, "id_token", "chatgpt_account_id"),
+			Status:            firstString(file, "status"),
+			Source:            firstString(file, "source"),
+			ReferralProgramID: inferReferralProgram(file),
 		})
 	}
 	sort.Slice(accounts, func(i, j int) bool {
@@ -1362,15 +1432,36 @@ func parseCodexCredential(raw []byte) (codexCredential, error) {
 }
 
 func sendInvite(ctx context.Context, cfg pluginConfig, credential codexCredential, account accountInfo, emails []string, referralKey string, requestCookie string, proxyURL string) (inviteResponse, error) {
-	// Try the new referral invite endpoint first (program_id/entrypoint body shape used by
-	// the Codex desktop app). Fall back to the legacy wham endpoint if the new one is not
-	// available for this account.
 	result, errV2 := sendInviteV2(ctx, cfg, credential, account, emails, requestCookie, proxyURL)
-	if errV2 == nil && result.OK {
+	if errV2 != nil {
+		// A transport/read error is ambiguous for a state-changing request: the server may
+		// already have accepted the invitation. Never retry it through the legacy endpoint.
+		return inviteResponse{}, errV2
+	}
+	if result.OK {
 		return result, nil
 	}
-	// Legacy fallback.
-	return sendInviteLegacy(ctx, cfg, credential, account, emails, referralKey, requestCookie, proxyURL)
+	if !legacyInviteFallbackStatus(result.StatusCode) {
+		return result, httpStatusError{status: http.StatusBadGateway, msg: fmt.Sprintf("V2 invite endpoint rejected request: status %d", result.StatusCode)}
+	}
+
+	legacy, errLegacy := sendInviteLegacy(ctx, cfg, credential, account, emails, referralKey, requestCookie, proxyURL)
+	if errLegacy != nil {
+		return inviteResponse{}, errLegacy
+	}
+	if !legacy.OK {
+		return legacy, httpStatusError{status: http.StatusBadGateway, msg: fmt.Sprintf("legacy invite endpoint rejected request: status %d", legacy.StatusCode)}
+	}
+	return legacy, nil
+}
+
+func legacyInviteFallbackStatus(status int) bool {
+	switch status {
+	case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusGone, http.StatusNotImplemented:
+		return true
+	default:
+		return false
+	}
 }
 
 // sendInviteV2 posts to /backend-api/referrals/invite with the new body shape
@@ -1381,7 +1472,7 @@ func sendInviteV2(ctx context.Context, cfg pluginConfig, credential codexCredent
 		return inviteResponse{}, errEndpoint
 	}
 	body, errMarshal := json.Marshal(map[string]any{
-		"program_id": programIDConsumer,
+		"program_id": referralProgramForAccount(account),
 		"entrypoint": entrypointPersistent,
 		"emails":     emails,
 	})
@@ -1475,76 +1566,134 @@ const chatGPTUpstreamHost = "chatgpt.com"
 type utlsRoundTripper struct {
 	mu          sync.Mutex
 	connections map[string]*http2.ClientConn
-	pending     map[string]*sync.Cond
+	pending     map[string]chan struct{}
 	dialer      proxy.Dialer
 }
 
 func newUtlsRoundTripper(dialer proxy.Dialer) *utlsRoundTripper {
 	return &utlsRoundTripper{
 		connections: make(map[string]*http2.ClientConn),
-		pending:     make(map[string]*sync.Cond),
+		pending:     make(map[string]chan struct{}),
 		dialer:      dialer,
 	}
 }
 
-func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.ClientConn, error) {
-	t.mu.Lock()
+type proxyContextDialer interface {
+	DialContext(context.Context, string, string) (net.Conn, error)
+}
 
-	if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
-		t.mu.Unlock()
-		return h2Conn, nil
+func dialProxyContext(ctx context.Context, dialer proxy.Dialer, network, addr string) (net.Conn, error) {
+	if contextDialer, ok := dialer.(proxyContextDialer); ok {
+		return contextDialer.DialContext(ctx, network, addr)
 	}
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	resultCh := make(chan dialResult, 1)
+	go func() {
+		conn, err := dialer.Dial(network, addr)
+		resultCh <- dialResult{conn: conn, err: err}
+	}()
+	select {
+	case result := <-resultCh:
+		return result.conn, result.err
+	case <-ctx.Done():
+		go func() {
+			result := <-resultCh
+			if result.conn != nil {
+				_ = result.conn.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
+}
 
-	if cond, ok := t.pending[host]; ok {
-		cond.Wait()
+func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
+	for {
+		t.mu.Lock()
 		if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
 			t.mu.Unlock()
 			return h2Conn, nil
 		}
+		if stale, ok := t.connections[host]; ok {
+			delete(t.connections, host)
+			t.mu.Unlock()
+			_ = stale.Close()
+			continue
+		}
+		if wait, ok := t.pending[host]; ok {
+			t.mu.Unlock()
+			select {
+			case <-wait:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		wait := make(chan struct{})
+		t.pending[host] = wait
+		t.mu.Unlock()
+
+		h2Conn, errCreate := t.createConnection(ctx, host, addr)
+		t.mu.Lock()
+		delete(t.pending, host)
+		if errCreate == nil {
+			t.connections[host] = h2Conn
+		}
+		close(wait)
+		t.mu.Unlock()
+		return h2Conn, errCreate
 	}
-
-	cond := sync.NewCond(&t.mu)
-	t.pending[host] = cond
-	t.mu.Unlock()
-
-	h2Conn, errCreate := t.createConnection(host, addr)
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	delete(t.pending, host)
-	cond.Broadcast()
-
-	if errCreate != nil {
-		return nil, errCreate
-	}
-
-	t.connections[host] = h2Conn
-	return h2Conn, nil
 }
 
-func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientConn, error) {
-	conn, errDial := t.dialer.Dial("tcp", addr)
+func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
+	conn, errDial := dialProxyContext(ctx, t.dialer, "tcp", addr)
 	if errDial != nil {
 		return nil, errDial
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
 	}
 
 	tlsConfig := &tls.Config{ServerName: host}
 	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
-
-	if errHandshake := tlsConn.Handshake(); errHandshake != nil {
+	handshakeCh := make(chan error, 1)
+	go func() { handshakeCh <- tlsConn.Handshake() }()
+	select {
+	case errHandshake := <-handshakeCh:
+		if errHandshake != nil {
+			_ = conn.Close()
+			return nil, errHandshake
+		}
+	case <-ctx.Done():
 		_ = conn.Close()
-		return nil, errHandshake
+		return nil, ctx.Err()
 	}
 
-	tr := &http2.Transport{}
-	h2Conn, errNew := tr.NewClientConn(tlsConn)
-	if errNew != nil {
+	type clientConnResult struct {
+		conn *http2.ClientConn
+		err  error
+	}
+	newConnCh := make(chan clientConnResult, 1)
+	go func() {
+		tr := &http2.Transport{}
+		h2Conn, errNew := tr.NewClientConn(tlsConn)
+		newConnCh <- clientConnResult{conn: h2Conn, err: errNew}
+	}()
+	select {
+	case result := <-newConnCh:
+		if result.err != nil {
+			_ = tlsConn.Close()
+			return nil, result.err
+		}
+		_ = tlsConn.SetDeadline(time.Time{})
+		return result.conn, nil
+	case <-ctx.Done():
 		_ = tlsConn.Close()
-		return nil, errNew
+		return nil, ctx.Err()
 	}
-
-	return h2Conn, nil
 }
 
 func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -1555,18 +1704,23 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 	addr := net.JoinHostPort(hostname, port)
 
-	h2Conn, errGet := t.getOrCreateConnection(hostname, addr)
+	h2Conn, errGet := t.getOrCreateConnection(req.Context(), hostname, addr)
 	if errGet != nil {
 		return nil, errGet
 	}
 
 	resp, errTrip := h2Conn.RoundTrip(req)
 	if errTrip != nil {
+		removed := false
 		t.mu.Lock()
 		if cached, ok := t.connections[hostname]; ok && cached == h2Conn {
 			delete(t.connections, hostname)
+			removed = true
 		}
 		t.mu.Unlock()
+		if removed {
+			_ = h2Conn.Close()
+		}
 		return nil, errTrip
 	}
 
@@ -1606,7 +1760,7 @@ func (f *chatGPTFingerprintTransport) RoundTrip(req *http.Request) (*http.Respon
 func buildProxyDialer(proxyURL string) (proxy.Dialer, string, error) {
 	proxyURL = strings.TrimSpace(proxyURL)
 	if proxyURL == "" {
-		return proxy.Direct, "", nil
+		return &net.Dialer{Timeout: 15 * time.Second}, "", nil
 	}
 	parsed, errParse := url.Parse(proxyURL)
 	if errParse != nil {
@@ -1627,7 +1781,12 @@ func buildProxyDialer(proxyURL string) (proxy.Dialer, string, error) {
 	// For SOCKS proxies, golang.org/x/net/proxy dials the upstream directly so
 	// the uTLS handshake happens over the tunnel end-to-end.
 	if strings.HasPrefix(strings.ToLower(parsed.Scheme), "socks5") {
-		dialer, errFrom := proxy.FromURL(parsed, proxy.Direct)
+		dialURL := *parsed
+		if strings.EqualFold(dialURL.Scheme, "socks5h") {
+			dialURL.Scheme = "socks5"
+		}
+		forward := &net.Dialer{Timeout: 15 * time.Second}
+		dialer, errFrom := proxy.FromURL(&dialURL, forward)
 		if errFrom != nil {
 			return nil, "", fmt.Errorf("build socks proxy dialer: %w", errFrom)
 		}
@@ -1645,7 +1804,21 @@ type httpConnectDialer struct {
 }
 
 func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
-	return d.dialConnect(context.Background(), network, addr)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return d.DialContext(ctx, network, addr)
+}
+
+func (d *httpConnectDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return d.dialConnect(ctx, network, addr)
+}
+
+func proxyTLSConfig(host string) *stdtls.Config {
+	return &stdtls.Config{
+		ServerName: host,
+		MinVersion: stdtls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
+	}
 }
 
 func (d *httpConnectDialer) dialConnect(ctx context.Context, _, addr string) (net.Conn, error) {
@@ -1658,28 +1831,25 @@ func (d *httpConnectDialer) dialConnect(ctx context.Context, _, addr string) (ne
 		}
 	}
 
-	var dial func(network, address string) (net.Conn, error)
-	dial = func(network, address string) (net.Conn, error) {
-		return net.DialTimeout(network, address, 15*time.Second)
-	}
-
-	var rawConn net.Conn
-	var errDial error
-	rawConn, errDial = dial("tcp", proxyAddr)
+	netDialer := &net.Dialer{Timeout: 15 * time.Second}
+	rawConn, errDial := netDialer.DialContext(ctx, "tcp", proxyAddr)
 	if errDial != nil {
 		return nil, fmt.Errorf("dial proxy %s: %w", proxyAddr, errDial)
 	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = rawConn.SetDeadline(deadline)
+	}
 
-	// Wrap in TLS only for https:// proxies.
 	if strings.EqualFold(d.proxyURL.Scheme, "https") {
-		rawConn = tls.UClient(rawConn, &tls.Config{ServerName: d.proxyURL.Hostname()}, tls.HelloChrome_Auto)
-		if errHandshake := rawConn.(*tls.UConn).Handshake(); errHandshake != nil {
+		tlsConn := stdtls.Client(rawConn, proxyTLSConfig(d.proxyURL.Hostname()))
+		if errHandshake := tlsConn.HandshakeContext(ctx); errHandshake != nil {
 			_ = rawConn.Close()
 			return nil, fmt.Errorf("tls handshake to proxy %s: %w", proxyAddr, errHandshake)
 		}
+		rawConn = tlsConn
 	}
 
-	connectReq, errReq := http.NewRequest(http.MethodConnect, "https://"+addr, nil)
+	connectReq, errReq := http.NewRequestWithContext(ctx, http.MethodConnect, "https://"+addr, nil)
 	if errReq != nil {
 		_ = rawConn.Close()
 		return nil, errReq
@@ -1707,9 +1877,8 @@ func (d *httpConnectDialer) dialConnect(ctx context.Context, _, addr string) (ne
 		_ = rawConn.Close()
 		return nil, fmt.Errorf("proxy %s rejected CONNECT to %s: %s", proxyAddr, addr, resp.Status)
 	}
+	_ = rawConn.SetDeadline(time.Time{})
 
-	// If the CONNECT response buffered any extra bytes, hand them back via a
-	// combined reader so the TLS handshake does not lose them.
 	if br.Buffered() > 0 {
 		return &bufferedConn{r: br, Conn: rawConn}, nil
 	}
@@ -1739,8 +1908,12 @@ func inviteHTTPClient(proxyURL string) (*http.Client, error) {
 	if proxyURL != "" {
 		parsed, _ := url.Parse(proxyURL)
 		if parsed != nil {
+			standardProxy := *parsed
+			if strings.EqualFold(standardProxy.Scheme, "socks5h") {
+				standardProxy.Scheme = "socks5"
+			}
 			standard := http.DefaultTransport.(*http.Transport).Clone()
-			standard.Proxy = http.ProxyURL(parsed)
+			standard.Proxy = http.ProxyURL(&standardProxy)
 			fallback = standard
 		}
 	}
@@ -1929,54 +2102,53 @@ func windowFromAny(value any) *usageRateWindow {
 // Every probed response is echoed under the response's dedicated fields plus upstream/upstream_raw
 // for transparency.
 func fetchReferralCapacity(ctx context.Context, cfg pluginConfig, credential codexCredential, account accountInfo, requestCookie, proxyURL string) (referralsResponse, error) {
-	result := referralsResponse{OK: true, Account: account}
+	result := referralsResponse{Account: account}
+	anySuccess := false
 
 	type probeOutcome struct {
 		statusCode int
 		raw        []byte
+		success    bool
 		hit        bool
+		err        error
 	}
 	probe := func(endpointPath string) probeOutcome {
 		status, _, raw, errGet := codexGet(ctx, cfg, credential, endpointPath, requestCookie, proxyURL)
-		if errGet != nil || len(raw) == 0 {
-			return probeOutcome{statusCode: status}
-		}
-		return probeOutcome{statusCode: status, raw: raw, hit: status >= 200 && status < 300}
+		success := errGet == nil && status >= 200 && status < 300
+		return probeOutcome{statusCode: status, raw: raw, success: success, hit: success && len(raw) > 0, err: errGet}
 	}
 	probeURL := func(fullURL string) probeOutcome {
 		status, _, raw, errGet := codexGetURL(ctx, cfg, credential, fullURL, requestCookie, proxyURL)
-		if errGet != nil || len(raw) == 0 {
-			return probeOutcome{statusCode: status}
-		}
-		return probeOutcome{statusCode: status, raw: raw, hit: status >= 200 && status < 300}
+		success := errGet == nil && status >= 200 && status < 300
+		return probeOutcome{statusCode: status, raw: raw, success: success, hit: success && len(raw) > 0, err: errGet}
 	}
 
-	// 1. invite/eligibility — the canonical invite-capacity endpoint from the Codex desktop
-	//    app. Parameters: program_id (consumer vs workspace) + entrypoint (persistent vs rate_limit).
-	//    The desktop app sends OpenAI-Internal-Referral-Eligibility-Preview: true to receive the
-	//    upgraded offer amounts (e.g. credits_500 instead of credits_250), so we send it too.
-	eligBaseURL, errEligURL := codexEndpoint(cfg.BaseURL, inviteEligibilityEndpointPath)
+	programID := referralProgramForAccount(account)
 	hasCookie := strings.TrimSpace(requestCookie) != "" || strings.TrimSpace(cfg.Cookie) != ""
+
+	eligBaseURL, errEligURL := codexEndpoint(cfg.BaseURL, inviteEligibilityEndpointPath)
 	if errEligURL == nil {
-		progID := programIDConsumer
-		eligURL := eligBaseURL + "?program_id=" + progID + "&entrypoint=" + entrypointPersistent
+		eligURL := eligBaseURL + "?program_id=" + url.QueryEscape(programID) + "&entrypoint=" + entrypointPersistent
 		previewHeaders := http.Header{"OpenAI-Internal-Referral-Eligibility-Preview": []string{"true"}}
 		eligStatus, _, eligRaw, eligErr := codexGetURLWithHeaders(ctx, cfg, credential, eligURL, requestCookie, proxyURL, previewHeaders)
 		result.EligibilityStatus = eligStatus
-		if eligErr == nil && eligStatus >= 200 && eligStatus < 300 && len(eligRaw) > 0 {
-			result.EligibilityHit = true
-			result.Eligibility = jsonRawMessage(eligRaw)
-			liftEligibilityFields(&result, eligRaw)
+		if eligErr == nil && eligStatus >= 200 && eligStatus < 300 {
+			anySuccess = true
+			if len(eligRaw) > 0 {
+				result.EligibilityHit = true
+				result.Eligibility = jsonRawMessage(eligRaw)
+				liftEligibilityFields(&result, eligRaw)
+			}
 		} else if !hasCookie && eligStatus == http.StatusForbidden {
-			result.Note = "邀请资格端点（/referrals/invite/eligibility）仅用 Bearer token 时返回 403，需要浏览器 Cookie 才能访问。如需查看「每邀请奖励额度」和「剩余邀请次数」，请在 Cookie 输入框填入该账号的浏览器 Cookie 后重试。"
+			result.Note = "邀请资格端点需要浏览器 Cookie；请在 Cookie 输入框填入该账号的浏览器 Cookie 后重试。"
 		}
 	}
 
-	// 1b. invite/tracking — lists sent invites (counts how many people you've already invited).
 	trackBaseURL, errTrackURL := codexEndpoint(cfg.BaseURL, inviteTrackingEndpointPath)
 	if errTrackURL == nil {
-		trackURL := trackBaseURL + "?limit=100&period=past_90_days&program_id=" + programIDConsumer
+		trackURL := trackBaseURL + "?limit=100&period=past_90_days&program_id=" + url.QueryEscape(programID)
 		track := probeURL(trackURL)
+		anySuccess = anySuccess || track.success
 		result.TrackingHit = track.hit
 		if track.hit {
 			result.Tracking = jsonRawMessage(track.raw)
@@ -1984,29 +2156,37 @@ func fetchReferralCapacity(ctx context.Context, cfg pluginConfig, credential cod
 		}
 	}
 
-	// 2. rate-limit-reset-credits — banked reset credits (the reward referrals grant).
 	resetCredits := probe(resetCreditsEndpointPath)
+	anySuccess = anySuccess || resetCredits.success
 	result.ResetCreditsHit = resetCredits.hit
 	if resetCredits.hit {
 		result.ResetCredits = jsonRawMessage(resetCredits.raw)
 	}
 
-	// 3. referrals/status — legacy status probe.
 	status := probe(referralsStatusEndpointPath)
+	anySuccess = anySuccess || status.success
 	result.StatusStatusCode = status.statusCode
 	if status.hit {
 		result.StatusEndpointHit = true
 		liftReferralFields(&result, status.raw, "status")
 	}
 
-	// 4. usage fallback — least specific, but always available on Pro accounts. Only run if no
-	// dedicated endpoint returned invite data yet.
-	if !result.EligibilityHit && !status.hit {
+	credits := probe(referralsCreditsEndpointPath)
+	anySuccess = anySuccess || credits.success
+	result.ReferralCreditsStatus = credits.statusCode
+	result.ReferralCreditsHit = credits.hit
+	if credits.hit {
+		result.ReferralCredits = jsonRawMessage(credits.raw)
+		liftReferralFields(&result, credits.raw, "credits")
+	}
+
+	if !result.EligibilityHit && !status.hit && !credits.hit {
 		usage, errUsage := fetchCodexUsage(ctx, cfg, credential, account, requestCookie, proxyURL)
 		if errUsage == nil && usage.StatusCode >= 200 && usage.StatusCode < 300 {
+			anySuccess = true
 			result.UsageEndpointUsed = true
 			if result.Note == "" {
-				result.Note = "referrals/status 与 referrals/credits 均未返回数据，已回退显示 Codex 用量载荷。ChatGPT 未通过专门端点暴露剩余邀请次数；可将 rate_limit_reset_credits（重置额度）视作邀请赠送的额度。"
+				result.Note = "专门邀请端点未返回数据，已回退显示 Codex 用量载荷。"
 			}
 			if usage.Upstream != nil {
 				if raw, errMarshal := json.Marshal(usage.Upstream); errMarshal == nil {
@@ -2015,15 +2195,17 @@ func fetchReferralCapacity(ctx context.Context, cfg pluginConfig, credential cod
 			} else if usage.UpstreamRaw != "" {
 				result.UpstreamRaw = usage.UpstreamRaw
 			}
-		} else if errUsage != nil {
-			if result.Note == "" {
-				result.Note = fmt.Sprintf("所有邀请相关端点均未响应，且用量探测失败：%s；ChatGPT 可能未对该账号暴露剩余邀请计数。", errUsage.Error())
-			}
-		} else if result.Note == "" {
-			result.Note = fmt.Sprintf("所有邀请相关端点均未响应（eligibility=%d，status=%d）；ChatGPT 可能未对该账号暴露剩余邀请计数。", result.EligibilityStatus, status.statusCode)
 		}
 	}
 
+	if !anySuccess {
+		message := fmt.Sprintf("all referral-related upstream probes failed (eligibility=%d, status=%d, credits=%d)", result.EligibilityStatus, result.StatusStatusCode, result.ReferralCreditsStatus)
+		if !hasCookie && result.EligibilityStatus == http.StatusForbidden {
+			message += "; eligibility requires a browser Cookie"
+		}
+		return referralsResponse{}, httpStatusError{status: http.StatusBadGateway, msg: message}
+	}
+	result.OK = true
 	return result, nil
 }
 
@@ -2054,8 +2236,11 @@ func liftEligibilityFields(result *referralsResponse, raw []byte) {
 	if v, ok := data["remaining_send_capacity"]; ok && v != nil {
 		result.RemainingInvites = v
 	}
-	// remaining_reward_capacity = how many more rewards you can still earn.
+	// remaining_reward_capacity is distinct from the send-cap ceiling.
 	if v, ok := data["remaining_reward_capacity"]; ok && v != nil {
+		result.RemainingRewardCapacity = v
+	}
+	if v, ok := data["max_send_capacity"]; ok && v != nil {
 		result.MaxInvites = v
 	}
 }
@@ -3076,6 +3261,10 @@ func renderUsagePage(cfg pluginConfig) string {
           <span data-i18n="account.credential">Codex credential</span>
           <select id="account"></select>
         </label>
+        <label>
+          <span data-i18n="account.cookie">Browser Cookie (optional)</span>
+          <input id="cookie" type="password" autocomplete="off" spellcheck="false">
+        </label>
       </div>
       <div class="actions">
         <button id="reload" class="secondary" type="button" data-i18n="account.reload">Reload accounts</button>
@@ -3111,6 +3300,7 @@ func renderUsagePage(cfg pluginConfig) string {
         'account.title': 'Account',
         'account.managementKey': 'CPA management key',
         'account.credential': 'Codex credential',
+        'account.cookie': 'Browser Cookie (optional)',
         'account.reload': 'Reload accounts',
         'account.queryUsage': 'Query usage',
         'account.queryReferrals': 'Query remaining invites',
@@ -3173,6 +3363,7 @@ func renderUsagePage(cfg pluginConfig) string {
         'account.title': '账号',
         'account.managementKey': 'CPA 管理密钥',
         'account.credential': 'Codex 凭据',
+        'account.cookie': '浏览器 Cookie（可选）',
         'account.reload': '重新加载账号',
         'account.queryUsage': '查询用量',
         'account.queryReferrals': '查询剩余邀请次数',
@@ -3277,6 +3468,7 @@ func renderUsagePage(cfg pluginConfig) string {
       return { Authorization: authorization, 'X-Codex-Invite-Origin': origin };
     }
     const accountSelect = document.getElementById('account');
+    const cookieInput = document.getElementById('cookie');
     const reloadBtn = document.getElementById('reload');
     const usageBtn = document.getElementById('queryUsage');
     const refsBtn = document.getElementById('queryReferrals');
@@ -3374,6 +3566,7 @@ func renderUsagePage(cfg pluginConfig) string {
           language: settings.language,
           originator: settings.originator,
           user_agent: settings.userAgent,
+          cookie: cookieInput.value.trim(),
           management_origin: origin
         };
         const response = await fetch(path, {
@@ -3429,16 +3622,17 @@ func renderUsagePage(cfg pluginConfig) string {
         rows.push([t('metric.source'), 'invite/tracking']);
       } else if (d.usage_endpoint_used) {
         rows.push([t('metric.source'), t('source.usageFallback')]);
+      } else if (d.status_endpoint_hit) {
+        rows.push([t('metric.source'), t('source.status')]);
       } else {
-        rows.push([t('metric.source'), d.status_endpoint_hit ? t('source.status') : t('source.credits')]);
+        rows.push([t('metric.source'), d.referrals_credits_endpoint_hit ? t('source.credits') : t('source.usageFallback')]);
       }
       // Tracking: how many invites sent in past 90 days.
       if (d.tracking_endpoint_hit) {
         rows.push([t('metric.invitesSent'), fmtNumber(d.tracking_invite_count)]);
       }
-      // Eligibility hit → remaining_reward_capacity is the "max rewards left" ceiling.
-      if (d.eligibility_endpoint_hit && d.max_invites != null) {
-        rows.push([t('metric.remainingReward'), fmtNumber(d.max_invites)]);
+      if (d.eligibility_endpoint_hit && d.remaining_reward_capacity != null) {
+        rows.push([t('metric.remainingReward'), fmtNumber(d.remaining_reward_capacity)]);
       }
       // Eligibility reward details (title, description, per-side grant amounts, rules).
       if (d.eligibility_endpoint_hit && d.eligibility && typeof d.eligibility === 'object') {
@@ -3501,6 +3695,7 @@ func renderUsagePage(cfg pluginConfig) string {
         const payload = {
           auth_index: selected.value,
           auth_name: selected.dataset.name || '',
+          cookie: cookieInput.value.trim(),
           management_origin: origin
         };
         const response = await fetch('/v0/management/codex-invite/redeem', {

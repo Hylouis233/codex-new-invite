@@ -61,6 +61,7 @@ The plugin currently integrates with these `chatgpt.com` backend paths:
 | `GET` | `/backend-api/codex/usage` |
 | `GET` | `/backend-api/referrals/invite/eligibility` |
 | `GET` | `/backend-api/referrals/invite/tracking` |
+| `GET` | `/backend-api/wham/referrals/credits` |
 | `GET` | `/backend-api/wham/rate-limit-reset-credits` |
 | `POST` | `/backend-api/wham/rate-limit-reset-credits/consume` |
 | `GET` | `/backend-api/wham/usage` |

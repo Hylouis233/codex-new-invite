@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -298,5 +300,170 @@ func TestResolveManualCredential(t *testing.T) {
 	}
 	if acc.Source != "manual" {
 		t.Fatalf("account source = %q, want manual", acc.Source)
+	}
+}
+
+func TestParseQueryRequestRejectsMalformedNonEmptyJSON(t *testing.T) {
+	if _, err := parseQueryRequest([]byte(`{"auth_index":`)); err == nil {
+		t.Fatal("parseQueryRequest() error = nil, want malformed JSON error")
+	}
+	response := handleRedeem(pluginapi.ManagementRequest{Body: []byte(`{"auth_index":`)})
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("handleRedeem malformed status = %d, want 400", response.StatusCode)
+	}
+}
+
+func TestLegacyInviteFallbackOnlyForDefinitiveUnsupportedStatuses(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusGone, http.StatusNotImplemented} {
+		if !legacyInviteFallbackStatus(status) {
+			t.Fatalf("legacyInviteFallbackStatus(%d) = false, want true", status)
+		}
+	}
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusTooManyRequests, http.StatusInternalServerError} {
+		if legacyInviteFallbackStatus(status) {
+			t.Fatalf("legacyInviteFallbackStatus(%d) = true, want false", status)
+		}
+	}
+}
+
+func TestSendInviteDoesNotRetryLegacyAfterAmbiguousV2Failure(t *testing.T) {
+	requests := 0
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"uncertain"}`))
+	}))
+	defer proxyServer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := sendInvite(ctx, pluginConfig{BaseURL: "http://chatgpt.example"}, codexCredential{AccessToken: "token"}, accountInfo{}, []string{"x@example.com"}, "legacy", "", proxyServer.URL)
+	if err == nil {
+		t.Fatal("sendInvite() error = nil, want V2 failure")
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want one V2 request and no legacy retry", requests)
+	}
+}
+
+func TestWorkspaceReferralProgramIsSelected(t *testing.T) {
+	if got := inferReferralProgram(map[string]any{"account_type": "workspace"}); got != programIDWorkspace {
+		t.Fatalf("inferReferralProgram(workspace) = %q", got)
+	}
+	if got := referralProgramForAccount(accountInfo{ReferralProgramID: programIDWorkspace}); got != programIDWorkspace {
+		t.Fatalf("referralProgramForAccount() = %q", got)
+	}
+
+	seenBody := make(chan string, 1)
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		seenBody <- string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"invites":[]}`))
+	}))
+	defer proxyServer.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	result, err := sendInviteV2(ctx, pluginConfig{BaseURL: "http://chatgpt.example"}, codexCredential{AccessToken: "token"}, accountInfo{ReferralProgramID: programIDWorkspace}, []string{"x@example.com"}, "", proxyServer.URL)
+	if err != nil || !result.OK {
+		t.Fatalf("sendInviteV2() result=%#v err=%v", result, err)
+	}
+	if body := <-seenBody; !strings.Contains(body, `"program_id":"codex_referral_workspace"`) {
+		t.Fatalf("workspace invite body = %s", body)
+	}
+}
+
+func TestLiftEligibilitySeparatesRewardCapacityFromMaxInvites(t *testing.T) {
+	var result referralsResponse
+	liftEligibilityFields(&result, []byte(`{"remaining_send_capacity":3,"remaining_reward_capacity":2,"max_send_capacity":5}`))
+	if result.RemainingInvites != float64(3) || result.RemainingRewardCapacity != float64(2) || result.MaxInvites != float64(5) {
+		t.Fatalf("eligibility projection = %#v", result)
+	}
+}
+
+func TestReferralCapacityProbesDedicatedCreditsBeforeUsageFallback(t *testing.T) {
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == referralsCreditsEndpointPath {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"remaining_invites":4,"max_invites":8}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer proxyServer.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result, err := fetchReferralCapacity(ctx, pluginConfig{BaseURL: "http://chatgpt.example"}, codexCredential{AccessToken: "token"}, accountInfo{}, "", proxyServer.URL)
+	if err != nil {
+		t.Fatalf("fetchReferralCapacity() error = %v", err)
+	}
+	if !result.ReferralCreditsHit || result.UsageEndpointUsed {
+		t.Fatalf("referral result = %#v", result)
+	}
+	if result.RemainingInvites != float64(4) || result.MaxInvites != float64(8) {
+		t.Fatalf("credits projection = %#v", result)
+	}
+}
+
+func TestReferralCapacityFailsClosedWhenEveryProbeFails(t *testing.T) {
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer proxyServer.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err := fetchReferralCapacity(ctx, pluginConfig{BaseURL: "http://chatgpt.example"}, codexCredential{AccessToken: "token"}, accountInfo{}, "", proxyServer.URL)
+	if err == nil {
+		t.Fatal("fetchReferralCapacity() error = nil, want all-probes-failed error")
+	}
+}
+
+func TestBuildProxyDialerAcceptsSocks5HAlias(t *testing.T) {
+	if _, _, err := buildProxyDialer("socks5h://127.0.0.1:1080"); err != nil {
+		t.Fatalf("buildProxyDialer(socks5h) error = %v", err)
+	}
+}
+
+type cancelAwareDialer struct{}
+
+func (cancelAwareDialer) Dial(string, string) (net.Conn, error) {
+	return nil, errors.New("context-free Dial must not be used")
+}
+
+func (cancelAwareDialer) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestUtlsConnectionSetupHonorsContextCancellation(t *testing.T) {
+	rt := newUtlsRoundTripper(cancelAwareDialer{})
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := rt.createConnection(ctx, "chatgpt.com", "chatgpt.com:443")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("createConnection() error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("createConnection() cancellation took %v", elapsed)
+	}
+}
+
+func TestHTTPSProxyTLSForcesHTTP11ALPN(t *testing.T) {
+	cfg := proxyTLSConfig("proxy.example")
+	if len(cfg.NextProtos) != 1 || cfg.NextProtos[0] != "http/1.1" {
+		t.Fatalf("proxy TLS ALPN = %#v, want only http/1.1", cfg.NextProtos)
+	}
+}
+
+func TestRenderUsagePageIncludesNonPersistentCookieInput(t *testing.T) {
+	page := renderUsagePage(defaultConfig())
+	for _, want := range []string{`id="cookie"`, `cookie: cookieInput.value.trim()`} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("usage page missing %q", want)
+		}
+	}
+	if strings.Contains(page, "codex-usage-cookie") {
+		t.Fatal("usage page persists Cookie in localStorage")
 	}
 }
