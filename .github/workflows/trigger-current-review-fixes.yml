@@ -2,7 +2,7 @@ name: Trigger current review fixes
 
 on:
   pull_request:
-    types: [opened, reopened]
+    types: [opened, reopened, synchronize]
 
 permissions:
   contents: write
