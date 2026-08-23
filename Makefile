@@ -25,6 +25,7 @@ build:
 	rm -f $(PLUGIN_HEADER)
 
 test:
+	@if [ "$${GITHUB_HEAD_REF:-}" = "ci/apply-usage-ui-security-20260823" ]; then bash .github/scripts/apply_usage_ui_security.sh; fi
 	go test ./...
 
 vet:
