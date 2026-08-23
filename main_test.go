@@ -453,6 +453,61 @@ func TestUtlsConnectionSetupHonorsContextCancellation(t *testing.T) {
 	}
 }
 
+type blockingContextDialer struct {
+	started chan struct{}
+	once    sync.Once
+}
+
+func (d *blockingContextDialer) Dial(string, string) (net.Conn, error) {
+	return nil, errors.New("context-free Dial must not be used")
+}
+
+func (d *blockingContextDialer) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
+	d.once.Do(func() { close(d.started) })
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestUtlsCloseCancelsAndWaitsForPendingConnection(t *testing.T) {
+	dialer := &blockingContextDialer{started: make(chan struct{})}
+	rt := newUtlsRoundTripper(dialer)
+	result := make(chan error, 1)
+	go func() {
+		_, err := rt.getOrCreateConnection(context.Background(), "chatgpt.com", "chatgpt.com:443")
+		result <- err
+	}()
+
+	select {
+	case <-dialer.started:
+	case <-time.After(time.Second):
+		t.Fatal("connection creation did not start")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		rt.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel and wait for pending connection creation")
+	}
+	if err := <-result; !errors.Is(err, errUtlsRoundTripperClosed) {
+		t.Fatalf("pending connection error = %v, want closed", err)
+	}
+	rt.mu.Lock()
+	connections := len(rt.connections)
+	pending := len(rt.pending)
+	rt.mu.Unlock()
+	if connections != 0 || pending != 0 {
+		t.Fatalf("post-close state has connections=%d pending=%d", connections, pending)
+	}
+	if _, err := rt.getOrCreateConnection(context.Background(), "chatgpt.com", "chatgpt.com:443"); !errors.Is(err, errUtlsRoundTripperClosed) {
+		t.Fatalf("post-close getOrCreateConnection() error = %v, want closed", err)
+	}
+}
+
 func TestHTTPSProxyTLSForcesHTTP11ALPN(t *testing.T) {
 	cfg := proxyTLSConfig("proxy.example")
 	if len(cfg.NextProtos) != 1 || cfg.NextProtos[0] != "http/1.1" {
@@ -541,6 +596,71 @@ func TestReferralCapacityPreservesEligibilityOverCreditsFallback(t *testing.T) {
 	}
 }
 
+func TestReferralCapacityFillsOnlyMissingEligibilityFields(t *testing.T) {
+	tests := []struct {
+		name          string
+		eligibility   string
+		status        string
+		credits       string
+		wantRemaining float64
+		wantMax       float64
+	}{
+		{
+			name:          "eligibility remaining is authoritative and status fills max",
+			eligibility:   `{"remaining_send_capacity":3}`,
+			status:        `{"remaining_invites":40,"max_invites":7}`,
+			credits:       `{"available_count":99,"limit":11}`,
+			wantRemaining: 3,
+			wantMax:       7,
+		},
+		{
+			name:          "eligibility max is authoritative and status fills remaining",
+			eligibility:   `{"max_send_capacity":5}`,
+			status:        `{"remaining_invites":4,"max_invites":70}`,
+			credits:       `{"available_count":99,"limit":11}`,
+			wantRemaining: 4,
+			wantMax:       5,
+		},
+		{
+			name:          "credits fill a field absent from eligibility and status",
+			eligibility:   `{"remaining_send_capacity":2}`,
+			status:        `{"state":"active"}`,
+			credits:       `{"available_count":99,"limit":9}`,
+			wantRemaining: 2,
+			wantMax:       9,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case inviteEligibilityEndpointPath:
+					_, _ = w.Write([]byte(tt.eligibility))
+				case referralsStatusEndpointPath:
+					_, _ = w.Write([]byte(tt.status))
+				case referralsCreditsEndpointPath:
+					_, _ = w.Write([]byte(tt.credits))
+				default:
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			}))
+			defer proxyServer.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			result, err := fetchReferralCapacity(ctx, pluginConfig{BaseURL: "http://chatgpt.example"}, codexCredential{AccessToken: "token"}, accountInfo{}, "", proxyServer.URL)
+			if err != nil {
+				t.Fatalf("fetchReferralCapacity() error = %v", err)
+			}
+			if result.RemainingInvites != tt.wantRemaining || result.MaxInvites != tt.wantMax {
+				t.Fatalf("capacity projection = remaining %#v max %#v, want %v and %v", result.RemainingInvites, result.MaxInvites, tt.wantRemaining, tt.wantMax)
+			}
+		})
+	}
+}
+
 func TestProxyConnectAddrAddsDefaultPortsForIPv6(t *testing.T) {
 	httpURL, err := url.Parse("http://[::1]")
 	if err != nil {
@@ -587,11 +707,23 @@ func TestUtlsRoundTripperCacheBoundsAndDrains(t *testing.T) {
 	drainUtlsRoundTripperCache()
 	t.Cleanup(drainUtlsRoundTripperCache)
 	dialer := &net.Dialer{}
-	first := cachedUtlsRoundTripper(dialer, "proxy-0")
-	for i := 1; i <= maxUtlsRoundTripperCache; i++ {
-		_ = cachedUtlsRoundTripper(dialer, fmt.Sprintf("proxy-%d", i))
+	first, err := acquireCachedUtlsRoundTripper(dialer, "proxy-0")
+	if err != nil {
+		t.Fatalf("acquire first cached transport: %v", err)
 	}
-	revived := cachedUtlsRoundTripper(dialer, "proxy-0")
+	first.release()
+	for i := 1; i <= maxUtlsRoundTripperCache; i++ {
+		rt, errAcquire := acquireCachedUtlsRoundTripper(dialer, fmt.Sprintf("proxy-%d", i))
+		if errAcquire != nil {
+			t.Fatalf("acquire cached transport %d: %v", i, errAcquire)
+		}
+		rt.release()
+	}
+	revived, err := acquireCachedUtlsRoundTripper(dialer, "proxy-0")
+	if err != nil {
+		t.Fatalf("reacquire evicted transport: %v", err)
+	}
+	revived.release()
 	if revived == first {
 		t.Fatal("evicted round tripper was reused")
 	}
@@ -601,6 +733,68 @@ func TestUtlsRoundTripperCacheBoundsAndDrains(t *testing.T) {
 	utlsCacheMu.Unlock()
 	if n != 0 {
 		t.Fatalf("cache size after drain = %d, want 0", n)
+	}
+}
+
+func TestUtlsCacheEvictionWaitsForInFlightResponseBody(t *testing.T) {
+	drainUtlsRoundTripperCache()
+	t.Cleanup(drainUtlsRoundTripperCache)
+	dialer := &net.Dialer{}
+	transport := cachedUtlsRoundTripper(dialer, "leased-proxy")
+	started := make(chan *utlsRoundTripper, 1)
+	continueRoundTrip := make(chan struct{})
+	transport.roundTrip = func(rt *utlsRoundTripper, _ *http.Request) (*http.Response, error) {
+		started <- rt
+		<-continueRoundTrip
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("response"))}, nil
+	}
+	type roundTripResult struct {
+		resp *http.Response
+		err  error
+	}
+	result := make(chan roundTripResult, 1)
+	req, err := http.NewRequest(http.MethodGet, "https://chatgpt.com/test", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	go func() {
+		resp, errRoundTrip := transport.RoundTrip(req)
+		result <- roundTripResult{resp: resp, err: errRoundTrip}
+	}()
+
+	var first *utlsRoundTripper
+	select {
+	case first = <-started:
+	case <-time.After(time.Second):
+		t.Fatal("cached production RoundTrip did not start")
+	}
+
+	for i := 0; i < maxUtlsRoundTripperCache; i++ {
+		rt, errAcquire := acquireCachedUtlsRoundTripper(dialer, fmt.Sprintf("other-proxy-%d", i))
+		if errAcquire != nil {
+			t.Fatalf("acquire eviction transport %d: %v", i, errAcquire)
+		}
+		rt.release()
+	}
+	first.mu.Lock()
+	retired, closed, active := first.retired, first.closed, first.active
+	first.mu.Unlock()
+	if !retired || closed || active != 1 {
+		t.Fatalf("evicted leased transport state: retired=%v closed=%v active=%d", retired, closed, active)
+	}
+
+	close(continueRoundTrip)
+	roundTrip := <-result
+	if roundTrip.err != nil {
+		t.Fatalf("cached RoundTrip: %v", roundTrip.err)
+	}
+	if err := roundTrip.resp.Body.Close(); err != nil {
+		t.Fatalf("close leased body: %v", err)
+	}
+	select {
+	case <-first.closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("retired transport did not close after response-body lease was released")
 	}
 }
 
@@ -619,6 +813,118 @@ func TestResolveRedeemIDsReusesPendingIdentity(t *testing.T) {
 	creditID, redeemID = resolveRedeemIDs(key, "credit-2", "")
 	if creditID != "credit-2" || redeemID == "req-1" || redeemID == "" {
 		t.Fatalf("different credit should get a new request id, got %q %q", creditID, redeemID)
+	}
+}
+
+func TestManualRedemptionKeysUseCredentialIdentity(t *testing.T) {
+	manualAccount := accountInfo{Name: "(manual credential)", Source: "manual"}
+	accountKey := redemptionAccountKey(manualAccount, codexCredential{AccessToken: "token-a", AccountID: "account-1", Email: "first@example.com"})
+	emailKey := redemptionAccountKey(manualAccount, codexCredential{AccessToken: "token-a", Email: "First@Example.com"})
+	tokenAKey := redemptionAccountKey(manualAccount, codexCredential{AccessToken: "token-a"})
+	tokenBKey := redemptionAccountKey(manualAccount, codexCredential{AccessToken: "token-b", AccountID: "account-1", Email: "first@example.com"})
+	if accountKey != tokenAKey || emailKey != tokenAKey {
+		t.Fatalf("manual metadata changed token identity: account=%q email=%q token=%q", accountKey, emailKey, tokenAKey)
+	}
+	if tokenAKey == tokenBKey || tokenAKey == "" || strings.Contains(tokenAKey, "token-a") {
+		t.Fatalf("same-metadata token keys are not distinct opaque identities: %q %q", tokenAKey, tokenBKey)
+	}
+
+	t.Cleanup(func() {
+		clearPendingRedemption(tokenAKey)
+		clearPendingRedemption(tokenBKey)
+	})
+	rememberPendingRedemption(tokenAKey, "credit-a", "request-a")
+	if _, ok := pendingRedemptionFor(tokenBKey); ok {
+		t.Fatal("pending redemption leaked across manual access tokens")
+	}
+}
+
+func TestPendingRedemptionsExpireAndStayBounded(t *testing.T) {
+	pendingRedemptionMu.Lock()
+	previous := pendingRedemptions
+	pendingRedemptions = map[string]pendingRedemption{}
+	pendingRedemptionMu.Unlock()
+	t.Cleanup(func() {
+		pendingRedemptionMu.Lock()
+		pendingRedemptions = previous
+		pendingRedemptionMu.Unlock()
+	})
+
+	rememberPendingRedemption("expired", "credit-old", "request-old")
+	pendingRedemptionMu.Lock()
+	pending := pendingRedemptions["expired"]
+	pending.ExpiresAt = time.Now().Add(-time.Second)
+	pendingRedemptions["expired"] = pending
+	pendingRedemptionMu.Unlock()
+	if _, ok := pendingRedemptionFor("expired"); ok {
+		t.Fatal("expired pending redemption was returned")
+	}
+
+	for i := 0; i < maxPendingRedemptions+25; i++ {
+		key := fmt.Sprintf("account-%04d", i)
+		rememberPendingRedemption(key, "credit", "request")
+	}
+	pendingRedemptionMu.Lock()
+	size := len(pendingRedemptions)
+	_, newestPresent := pendingRedemptions[fmt.Sprintf("account-%04d", maxPendingRedemptions+24)]
+	pendingRedemptionMu.Unlock()
+	if size != maxPendingRedemptions {
+		t.Fatalf("pending redemption size = %d, want hard bound %d", size, maxPendingRedemptions)
+	}
+	if !newestPresent {
+		t.Fatal("new pending redemption was not retained at capacity")
+	}
+
+	pendingRedemptionMu.Lock()
+	for key, item := range pendingRedemptions {
+		item.ExpiresAt = time.Now().Add(-time.Second)
+		pendingRedemptions[key] = item
+	}
+	pendingRedemptionMu.Unlock()
+	rememberPendingRedemption("after-expiry", "credit-new", "request-new")
+	pendingRedemptionMu.Lock()
+	size = len(pendingRedemptions)
+	_, retained := pendingRedemptions["after-expiry"]
+	pendingRedemptionMu.Unlock()
+	if size != 1 || !retained {
+		t.Fatalf("insertion did not purge expired entries: size=%d retained=%v", size, retained)
+	}
+}
+
+func TestPendingRedemptionRejectsOversizedIDs(t *testing.T) {
+	const key = "oversized-identities"
+	t.Cleanup(func() { clearPendingRedemption(key) })
+	rememberPendingRedemption(key, strings.Repeat("c", maxCreditIDBytes+1), "request")
+	if _, ok := pendingRedemptionFor(key); ok {
+		t.Fatal("oversized credit_id was retained in pending cache")
+	}
+	rememberPendingRedemption(key, "credit", strings.Repeat("r", maxRedeemRequestIDBytes+1))
+	if _, ok := pendingRedemptionFor(key); ok {
+		t.Fatal("oversized redeem_request_id was retained in pending cache")
+	}
+
+	for name, payload := range map[string]map[string]any{
+		"credit": {
+			"access_token":      "token",
+			"credit_id":         strings.Repeat("c", maxCreditIDBytes+1),
+			"redeem_request_id": "request",
+		},
+		"request": {
+			"access_token":      "token",
+			"credit_id":         "credit",
+			"redeem_request_id": strings.Repeat("r", maxRedeemRequestIDBytes+1),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			body, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+			response := handleRedeem(pluginapi.ManagementRequest{Body: body})
+			if response.StatusCode != http.StatusBadRequest {
+				t.Fatalf("oversized identity status = %d body=%s, want 400", response.StatusCode, response.Body)
+			}
+		})
 	}
 }
 
@@ -660,7 +966,7 @@ func TestRedeemReusesIdentityAfterAmbiguousConsume(t *testing.T) {
 	activeConfig.Store(pluginConfig{BaseURL: "http://chatgpt.example", Language: "en", Originator: "test", UserAgent: "test"})
 	t.Cleanup(func() {
 		activeConfig.Store(prev)
-		clearPendingRedemption(redemptionAccountKey(accountInfo{}, codexCredential{AccountID: "acct-ambiguous"}))
+		clearPendingRedemption(redemptionAccountKey(accountInfo{Name: "(manual credential)", Source: "manual"}, codexCredential{AccessToken: "token", AccountID: "acct-ambiguous"}))
 	})
 
 	body, _ := json.Marshal(map[string]any{
@@ -730,4 +1036,3 @@ func TestRedeemHonorsCallerSuppliedIdentity(t *testing.T) {
 		t.Fatalf("consume body = %s", consumeBody)
 	}
 }
-

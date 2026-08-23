@@ -60,6 +60,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	stdtls "crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -976,6 +977,9 @@ func handleRedeem(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	if errIDs := validateRedeemIDs(payload.CreditID, payload.RedeemRequestID); errIDs != nil {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": errIDs.Error()})
+	}
 	accountKey := redemptionAccountKey(account, credential)
 	creditID, redeemReqID := resolveRedeemIDs(accountKey, payload.CreditID, payload.RedeemRequestID)
 
@@ -1015,6 +1019,9 @@ func handleRedeem(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 				"message":         "没有可用的重置额度（available credits = 0）。需要先通过邀请获得奖励后才能兑换。",
 			})
 		}
+	}
+	if errIDs := validateRedeemIDs(creditID, redeemReqID); errIDs != nil {
+		return jsonResponse(http.StatusBadGateway, map[string]any{"error": "invalid reset credit identity returned by upstream"})
 	}
 
 	consumeEndpoint, errEndpoint := codexEndpoint(cfg.BaseURL, consumeCreditsEndpointPath)
@@ -1111,7 +1118,14 @@ func newUUIDv4() string {
 type pendingRedemption struct {
 	CreditID        string
 	RedeemRequestID string
+	CreatedAt       time.Time
+	ExpiresAt       time.Time
 }
+
+const (
+	pendingRedemptionTTL  = 15 * time.Minute
+	maxPendingRedemptions = 1024
+)
 
 var (
 	pendingRedemptionMu sync.Mutex
@@ -1119,23 +1133,59 @@ var (
 )
 
 func redemptionAccountKey(account accountInfo, credential codexCredential) string {
+	manual := strings.EqualFold(strings.TrimSpace(account.Source), "manual") || strings.TrimSpace(account.Name) == "(manual credential)"
+	if manual && strings.TrimSpace(credential.AccessToken) != "" {
+		digest := sha256.Sum256([]byte("token:" + strings.TrimSpace(credential.AccessToken)))
+		return fmt.Sprintf("identity:%x", digest)
+	}
 	switch {
-	case strings.TrimSpace(account.AuthIndex) != "":
-		return "auth:" + strings.TrimSpace(account.AuthIndex)
 	case strings.TrimSpace(credential.AccountID) != "":
 		return "acct:" + strings.TrimSpace(credential.AccountID)
-	case strings.TrimSpace(account.Name) != "":
-		return "name:" + strings.TrimSpace(account.Name)
 	case strings.TrimSpace(credential.Email) != "":
-		return "email:" + strings.TrimSpace(credential.Email)
+		digest := sha256.Sum256([]byte("email:" + strings.ToLower(strings.TrimSpace(credential.Email))))
+		return fmt.Sprintf("identity:%x", digest)
+	case strings.TrimSpace(account.Email) != "":
+		digest := sha256.Sum256([]byte("email:" + strings.ToLower(strings.TrimSpace(account.Email))))
+		return fmt.Sprintf("identity:%x", digest)
+	case strings.TrimSpace(credential.AccessToken) != "":
+		digest := sha256.Sum256([]byte("token:" + strings.TrimSpace(credential.AccessToken)))
+		return fmt.Sprintf("identity:%x", digest)
+	case strings.TrimSpace(account.AuthIndex) != "":
+		return "auth:" + strings.TrimSpace(account.AuthIndex)
+	case strings.TrimSpace(account.Name) != "" && account.Name != "(manual credential)":
+		return "name:" + strings.TrimSpace(account.Name)
 	default:
-		return "manual"
+		return ""
+	}
+}
+
+const (
+	maxCreditIDBytes        = 256
+	maxRedeemRequestIDBytes = 256
+)
+
+func validateRedeemIDs(creditID, redeemRequestID string) error {
+	if len(strings.TrimSpace(creditID)) > maxCreditIDBytes {
+		return fmt.Errorf("credit_id exceeds %d bytes", maxCreditIDBytes)
+	}
+	if len(strings.TrimSpace(redeemRequestID)) > maxRedeemRequestIDBytes {
+		return fmt.Errorf("redeem_request_id exceeds %d bytes", maxRedeemRequestIDBytes)
+	}
+	return nil
+}
+
+func expirePendingRedemptionsLocked(now time.Time) {
+	for key, pending := range pendingRedemptions {
+		if !pending.ExpiresAt.After(now) {
+			delete(pendingRedemptions, key)
+		}
 	}
 }
 
 func pendingRedemptionFor(accountKey string) (pendingRedemption, bool) {
 	pendingRedemptionMu.Lock()
 	defer pendingRedemptionMu.Unlock()
+	expirePendingRedemptionsLocked(time.Now())
 	pending, ok := pendingRedemptions[accountKey]
 	return pending, ok
 }
@@ -1143,11 +1193,29 @@ func pendingRedemptionFor(accountKey string) (pendingRedemption, bool) {
 func rememberPendingRedemption(accountKey, creditID, redeemRequestID string) {
 	creditID = strings.TrimSpace(creditID)
 	redeemRequestID = strings.TrimSpace(redeemRequestID)
-	if accountKey == "" || creditID == "" || redeemRequestID == "" {
+	if accountKey == "" || creditID == "" || redeemRequestID == "" || validateRedeemIDs(creditID, redeemRequestID) != nil {
 		return
 	}
+	now := time.Now()
 	pendingRedemptionMu.Lock()
-	pendingRedemptions[accountKey] = pendingRedemption{CreditID: creditID, RedeemRequestID: redeemRequestID}
+	expirePendingRedemptionsLocked(now)
+	if _, exists := pendingRedemptions[accountKey]; !exists && len(pendingRedemptions) >= maxPendingRedemptions {
+		var oldestKey string
+		var oldestAt time.Time
+		for key, pending := range pendingRedemptions {
+			if oldestKey == "" || pending.CreatedAt.Before(oldestAt) {
+				oldestKey = key
+				oldestAt = pending.CreatedAt
+			}
+		}
+		delete(pendingRedemptions, oldestKey)
+	}
+	pendingRedemptions[accountKey] = pendingRedemption{
+		CreditID:        creditID,
+		RedeemRequestID: redeemRequestID,
+		CreatedAt:       now,
+		ExpiresAt:       now.Add(pendingRedemptionTTL),
+	}
 	pendingRedemptionMu.Unlock()
 }
 
@@ -1658,15 +1726,61 @@ const chatGPTUpstreamHost = "chatgpt.com"
 type utlsRoundTripper struct {
 	mu          sync.Mutex
 	connections map[string]*http2.ClientConn
-	pending     map[string]chan struct{}
+	pending     map[string]*pendingUtlsConnection
 	dialer      proxy.Dialer
+	closed      bool
+	retired     bool
+	active      int
+	closeDone   chan struct{}
 }
+
+type pendingUtlsConnection struct {
+	done   chan struct{}
+	cancel context.CancelFunc
+}
+
+var errUtlsRoundTripperClosed = errors.New("uTLS round tripper is closed")
 
 func newUtlsRoundTripper(dialer proxy.Dialer) *utlsRoundTripper {
 	return &utlsRoundTripper{
 		connections: make(map[string]*http2.ClientConn),
-		pending:     make(map[string]chan struct{}),
+		pending:     make(map[string]*pendingUtlsConnection),
 		dialer:      dialer,
+		closeDone:   make(chan struct{}),
+	}
+}
+
+func (t *utlsRoundTripper) acquire() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed || t.retired {
+		return errUtlsRoundTripperClosed
+	}
+	t.active++
+	return nil
+}
+
+func (t *utlsRoundTripper) release() {
+	shouldClose := false
+	t.mu.Lock()
+	if t.active > 0 {
+		t.active--
+	}
+	shouldClose = t.retired && t.active == 0 && !t.closed
+	t.mu.Unlock()
+	if shouldClose {
+		t.Close()
+	}
+}
+
+func (t *utlsRoundTripper) retire() {
+	shouldClose := false
+	t.mu.Lock()
+	t.retired = true
+	shouldClose = t.active == 0 && !t.closed
+	t.mu.Unlock()
+	if shouldClose {
+		t.Close()
 	}
 }
 
@@ -1704,6 +1818,10 @@ func dialProxyContext(ctx context.Context, dialer proxy.Dialer, network, addr st
 func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
 	for {
 		t.mu.Lock()
+		if t.closed {
+			t.mu.Unlock()
+			return nil, errUtlsRoundTripperClosed
+		}
 		if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
 			t.mu.Unlock()
 			return h2Conn, nil
@@ -1714,28 +1832,40 @@ func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr
 			_ = stale.Close()
 			continue
 		}
-		if wait, ok := t.pending[host]; ok {
+		if pending, ok := t.pending[host]; ok {
 			t.mu.Unlock()
 			select {
-			case <-wait:
+			case <-pending.done:
 				continue
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
 		}
 
-		wait := make(chan struct{})
-		t.pending[host] = wait
+		createCtx, cancelCreate := context.WithCancel(ctx)
+		pending := &pendingUtlsConnection{done: make(chan struct{}), cancel: cancelCreate}
+		t.pending[host] = pending
 		t.mu.Unlock()
 
-		h2Conn, errCreate := t.createConnection(ctx, host, addr)
+		h2Conn, errCreate := t.createConnection(createCtx, host, addr)
+		cancelCreate()
+		closeCreated := false
 		t.mu.Lock()
-		delete(t.pending, host)
-		if errCreate == nil {
+		if t.pending[host] == pending {
+			delete(t.pending, host)
+		}
+		if t.closed {
+			closeCreated = h2Conn != nil
+			errCreate = errUtlsRoundTripperClosed
+		} else if errCreate == nil {
 			t.connections[host] = h2Conn
 		}
-		close(wait)
 		t.mu.Unlock()
+		if closeCreated {
+			_ = h2Conn.Close()
+			h2Conn = nil
+		}
+		close(pending.done)
 		return h2Conn, errCreate
 	}
 }
@@ -1789,6 +1919,15 @@ func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr stri
 }
 
 func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := t.acquire(); err != nil {
+		return nil, err
+	}
+	return roundTripWithUtlsLease(t, req, func(req *http.Request) (*http.Response, error) {
+		return t.roundTrip(req)
+	})
+}
+
+func (t *utlsRoundTripper) roundTrip(req *http.Request) (*http.Response, error) {
 	hostname := req.URL.Hostname()
 	port := req.URL.Port()
 	if port == "" {
@@ -1822,6 +1961,36 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	return resp, nil
 }
 
+func roundTripWithUtlsLease(t *utlsRoundTripper, req *http.Request, roundTrip func(*http.Request) (*http.Response, error)) (*http.Response, error) {
+	resp, err := roundTrip(req)
+	if err != nil || resp == nil || resp.Body == nil {
+		t.release()
+		return resp, err
+	}
+	resp.Body = &utlsLeaseBody{ReadCloser: resp.Body, release: t.release}
+	return resp, nil
+}
+
+type utlsLeaseBody struct {
+	io.ReadCloser
+	release func()
+	once    sync.Once
+}
+
+func (b *utlsLeaseBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.once.Do(b.release)
+	}
+	return n, err
+}
+
+func (b *utlsLeaseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.release)
+	return err
+}
+
 func isHTTP2StreamScopedError(err error) bool {
 	if err == nil {
 		return false
@@ -1838,14 +2007,30 @@ func (t *utlsRoundTripper) Close() {
 		return
 	}
 	t.mu.Lock()
+	if t.closed {
+		done := t.closeDone
+		t.mu.Unlock()
+		<-done
+		return
+	}
+	t.closed = true
 	conns := t.connections
 	t.connections = make(map[string]*http2.ClientConn)
+	pending := make([]*pendingUtlsConnection, 0, len(t.pending))
+	for _, create := range t.pending {
+		pending = append(pending, create)
+		create.cancel()
+	}
 	t.mu.Unlock()
 	for _, conn := range conns {
 		if conn != nil {
 			_ = conn.Close()
 		}
 	}
+	for _, create := range pending {
+		<-create.done
+	}
+	close(t.closeDone)
 }
 
 const maxUtlsRoundTripperCache = 8
@@ -1855,30 +2040,63 @@ type utlsCacheSlot struct {
 	rt  *utlsRoundTripper
 }
 
+type cachedUtlsTransport struct {
+	dialer    proxy.Dialer
+	cacheKey  string
+	roundTrip func(*utlsRoundTripper, *http.Request) (*http.Response, error)
+}
+
 var (
 	utlsCacheMu    sync.Mutex
 	utlsCacheSlots []*utlsCacheSlot
 )
 
-func cachedUtlsRoundTripper(dialer proxy.Dialer, cacheKey string) *utlsRoundTripper {
+func cachedUtlsRoundTripper(dialer proxy.Dialer, cacheKey string) *cachedUtlsTransport {
+	return &cachedUtlsTransport{dialer: dialer, cacheKey: cacheKey}
+}
+
+func (t *cachedUtlsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	rt, err := acquireCachedUtlsRoundTripper(t.dialer, t.cacheKey)
+	if err != nil {
+		return nil, err
+	}
+	roundTrip := t.roundTrip
+	if roundTrip == nil {
+		roundTrip = func(rt *utlsRoundTripper, req *http.Request) (*http.Response, error) {
+			return rt.roundTrip(req)
+		}
+	}
+	return roundTripWithUtlsLease(rt, req, func(req *http.Request) (*http.Response, error) {
+		return roundTrip(rt, req)
+	})
+}
+
+func acquireCachedUtlsRoundTripper(dialer proxy.Dialer, cacheKey string) (*utlsRoundTripper, error) {
 	utlsCacheMu.Lock()
 	defer utlsCacheMu.Unlock()
 	for i, slot := range utlsCacheSlots {
 		if slot.key == cacheKey {
+			if err := slot.rt.acquire(); err != nil {
+				utlsCacheSlots = append(utlsCacheSlots[:i], utlsCacheSlots[i+1:]...)
+				break
+			}
 			if i != len(utlsCacheSlots)-1 {
 				utlsCacheSlots = append(append(utlsCacheSlots[:i], utlsCacheSlots[i+1:]...), slot)
 			}
-			return slot.rt
+			return slot.rt, nil
 		}
 	}
 	rt := newUtlsRoundTripper(dialer)
+	if err := rt.acquire(); err != nil {
+		return nil, err
+	}
 	utlsCacheSlots = append(utlsCacheSlots, &utlsCacheSlot{key: cacheKey, rt: rt})
 	for len(utlsCacheSlots) > maxUtlsRoundTripperCache {
 		evicted := utlsCacheSlots[0]
 		utlsCacheSlots = utlsCacheSlots[1:]
-		evicted.rt.Close()
+		evicted.rt.retire()
 	}
-	return rt
+	return rt, nil
 }
 
 func drainUtlsRoundTripperCache() {
@@ -1888,7 +2106,7 @@ func drainUtlsRoundTripperCache() {
 	utlsCacheMu.Unlock()
 	for _, slot := range slots {
 		if slot != nil && slot.rt != nil {
-			slot.rt.Close()
+			slot.rt.retire()
 		}
 	}
 }
@@ -2263,6 +2481,7 @@ func windowFromAny(value any) *usageRateWindow {
 func fetchReferralCapacity(ctx context.Context, cfg pluginConfig, credential codexCredential, account accountInfo, requestCookie, proxyURL string) (referralsResponse, error) {
 	result := referralsResponse{Account: account}
 	anySuccess := false
+	var capacitySet referralCapacityFields
 
 	type probeOutcome struct {
 		statusCode int
@@ -2296,7 +2515,7 @@ func fetchReferralCapacity(ctx context.Context, cfg pluginConfig, credential cod
 			if len(eligRaw) > 0 {
 				result.EligibilityHit = true
 				result.Eligibility = jsonRawMessage(eligRaw)
-				liftEligibilityFields(&result, eligRaw)
+				capacitySet = liftEligibilityFields(&result, eligRaw)
 			}
 		} else if !hasCookie && eligStatus == http.StatusForbidden {
 			result.Note = "邀请资格端点需要浏览器 Cookie；请在 Cookie 输入框填入该账号的浏览器 Cookie 后重试。"
@@ -2327,9 +2546,7 @@ func fetchReferralCapacity(ctx context.Context, cfg pluginConfig, credential cod
 	result.StatusStatusCode = status.statusCode
 	if status.hit {
 		result.StatusEndpointHit = true
-		if !result.EligibilityHit {
-			liftReferralFields(&result, status.raw, "status")
-		}
+		liftReferralFieldsIfMissing(&result, status.raw, "status", &capacitySet)
 	}
 
 	credits := probe(referralsCreditsEndpointPath)
@@ -2338,9 +2555,7 @@ func fetchReferralCapacity(ctx context.Context, cfg pluginConfig, credential cod
 	result.ReferralCreditsHit = credits.hit
 	if credits.hit {
 		result.ReferralCredits = jsonRawMessage(credits.raw)
-		if !result.EligibilityHit {
-			liftReferralFields(&result, credits.raw, "credits")
-		}
+		liftReferralFieldsIfMissing(&result, credits.raw, "credits", &capacitySet)
 	}
 
 	if !result.EligibilityHit && !status.hit && !credits.hit {
@@ -2387,17 +2602,24 @@ func jsonRawMessage(raw []byte) json.RawMessage {
 // liftEligibilityFields parses an invite/eligibility response body (from the Codex desktop
 // app's /referrals/invite/eligibility endpoint) and lifts the invite-capacity fields into the
 // response. Field names are reverse-engineered from app.asar.
-func liftEligibilityFields(result *referralsResponse, raw []byte) {
+type referralCapacityFields struct {
+	remaining bool
+	maximum   bool
+}
+
+func liftEligibilityFields(result *referralsResponse, raw []byte) referralCapacityFields {
+	var fields referralCapacityFields
 	if len(raw) == 0 {
-		return
+		return fields
 	}
 	var data map[string]any
 	if errJSON := json.Unmarshal(raw, &data); errJSON != nil {
-		return
+		return fields
 	}
 	// remaining_send_capacity = how many more invites you can send (canonical "invites left").
 	if v, ok := data["remaining_send_capacity"]; ok && v != nil {
 		result.RemainingInvites = v
+		fields.remaining = true
 	}
 	// remaining_reward_capacity is distinct from the send-cap ceiling.
 	if v, ok := data["remaining_reward_capacity"]; ok && v != nil {
@@ -2405,7 +2627,9 @@ func liftEligibilityFields(result *referralsResponse, raw []byte) {
 	}
 	if v, ok := data["max_send_capacity"]; ok && v != nil {
 		result.MaxInvites = v
+		fields.maximum = true
 	}
+	return fields
 }
 
 // liftTrackingCount counts valid invite records from the /referrals/invite/tracking response
@@ -2433,6 +2657,11 @@ func liftTrackingCount(result *referralsResponse, raw []byte) {
 // invite capacity into the response's remaining/max slots and the status mirror, while preserving
 // the full body under upstream/upstream_raw for transparency.
 func liftReferralFields(result *referralsResponse, raw []byte, source string) {
+	var fields referralCapacityFields
+	liftReferralFieldsIfMissing(result, raw, source, &fields)
+}
+
+func liftReferralFieldsIfMissing(result *referralsResponse, raw []byte, source string, fields *referralCapacityFields) {
 	if len(raw) == 0 {
 		return
 	}
@@ -2453,8 +2682,9 @@ func liftReferralFields(result *referralsResponse, raw []byte, source string) {
 		"available_invites", "available_count", "invites_available",
 		"left", "remaining_count",
 	} {
-		if value, present := lookupNested(data, key); present {
+		if value, present := lookupNested(data, key); present && value != nil && !fields.remaining {
 			result.RemainingInvites = value
+			fields.remaining = true
 			break
 		}
 	}
@@ -2463,8 +2693,9 @@ func liftReferralFields(result *referralsResponse, raw []byte, source string) {
 		"max_invites", "max", "total_invites", "total", "cap", "limit",
 		"monthly_invites", "invites_per_cycle",
 	} {
-		if value, present := lookupNested(data, key); present {
+		if value, present := lookupNested(data, key); present && value != nil && !fields.maximum {
 			result.MaxInvites = value
+			fields.maximum = true
 			break
 		}
 	}
