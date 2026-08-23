@@ -3,3 +3,4 @@
 /dist/
 *.h
 *.dSYM/
+*.exe
