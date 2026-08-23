@@ -115,27 +115,27 @@ func TestSendInviteUsesConfiguredProxy(t *testing.T) {
 	}
 
 	select {
-		case req := <-seen:
-			if req.Method != http.MethodPost {
-				t.Fatalf("proxied method = %q, want POST", req.Method)
-			}
-			// sendInvite tries the new V2 endpoint first (/backend-api/referrals/invite).
-			wantURL := "http://chatgpt.example/backend-api/referrals/invite"
-			if req.URL != wantURL {
-				t.Fatalf("proxied URL = %q, want %q", req.URL, wantURL)
-			}
-			if req.Authorization != "Bearer access-1" {
-				t.Fatalf("authorization = %q", req.Authorization)
-			}
-			if req.ContentType != "application/json" {
-				t.Fatalf("content type = %q", req.ContentType)
-			}
-			if !strings.Contains(req.Body, `"program_id":"codex_referral_consumer"`) || !strings.Contains(req.Body, `"entrypoint":"persistent"`) || !strings.Contains(req.Body, `"emails":["user@example.com"]`) {
-				t.Fatalf("body = %q", req.Body)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("proxy did not receive invite request")
+	case req := <-seen:
+		if req.Method != http.MethodPost {
+			t.Fatalf("proxied method = %q, want POST", req.Method)
 		}
+		// sendInvite tries the new V2 endpoint first (/backend-api/referrals/invite).
+		wantURL := "http://chatgpt.example/backend-api/referrals/invite"
+		if req.URL != wantURL {
+			t.Fatalf("proxied URL = %q, want %q", req.URL, wantURL)
+		}
+		if req.Authorization != "Bearer access-1" {
+			t.Fatalf("authorization = %q", req.Authorization)
+		}
+		if req.ContentType != "application/json" {
+			t.Fatalf("content type = %q", req.ContentType)
+		}
+		if !strings.Contains(req.Body, `"program_id":"codex_referral_consumer"`) || !strings.Contains(req.Body, `"entrypoint":"persistent"`) || !strings.Contains(req.Body, `"emails":["user@example.com"]`) {
+			t.Fatalf("body = %q", req.Body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy did not receive invite request")
+	}
 }
 
 func TestRenderInvitePageDoesNotPersistProxyURL(t *testing.T) {

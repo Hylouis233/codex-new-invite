@@ -25,7 +25,6 @@ build:
 	rm -f $(PLUGIN_HEADER)
 
 test:
-	@if [ "$${GITHUB_HEAD_REF:-}" = "ci/apply-host-callback-security-20260823" ]; then bash .github/scripts/apply_host_callback_security.sh; fi
 	go test ./...
 
 vet:

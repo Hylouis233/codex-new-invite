@@ -9,11 +9,14 @@ typedef struct {
 	size_t len;
 } cliproxy_buffer;
 
+typedef int (*cliproxy_host_call_fn)(void*, const char*, const uint8_t*, size_t, cliproxy_buffer*);
+typedef void (*cliproxy_host_free_fn)(void*, size_t);
+
 typedef struct {
 	uint32_t abi_version;
 	void* host_ctx;
-	void* call;
-	void* free_buffer;
+	cliproxy_host_call_fn call;
+	cliproxy_host_free_fn free_buffer;
 } cliproxy_host_api;
 
 typedef int (*cliproxy_plugin_call_fn)(char*, uint8_t*, size_t, cliproxy_buffer*);
@@ -30,6 +33,25 @@ typedef struct {
 extern int cliproxyPluginCall(char*, uint8_t*, size_t, cliproxy_buffer*);
 extern void cliproxyPluginFree(void*, size_t);
 extern void cliproxyPluginShutdown(void);
+
+static const cliproxy_host_api* stored_host;
+
+static void store_host_api(const cliproxy_host_api* host) {
+	stored_host = host;
+}
+
+static int call_host_api(const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
+	if (stored_host == NULL || stored_host->call == NULL) {
+		return 1;
+	}
+	return stored_host->call(stored_host->host_ctx, method, request, request_len, response);
+}
+
+static void free_host_buffer(void* ptr, size_t len) {
+	if (stored_host != NULL && stored_host->free_buffer != NULL && ptr != NULL) {
+		stored_host->free_buffer(ptr, len);
+	}
+}
 */
 import "C"
 
@@ -108,6 +130,8 @@ const (
 	entrypointPersistent          = "persistent"
 	entrypointRateLimit           = "rate_limit"
 	requestManagementOrigin       = "X-Codex-Invite-Origin"
+	hostAuthListMethod            = "host.auth.list"
+	hostAuthGetMethod             = "host.auth.get"
 	contentTypeJSON               = "application/json; charset=utf-8"
 	contentTypeHTML               = "text/html; charset=utf-8"
 	upstreamBodyLimit       int64 = 1 << 20
@@ -233,10 +257,11 @@ type codexCredential struct {
 }
 
 //export cliproxy_plugin_init
-func cliproxy_plugin_init(_ *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
+func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
 	if plugin == nil {
 		return 1
 	}
+	C.store_host_api(host)
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
@@ -278,7 +303,55 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 }
 
 //export cliproxyPluginShutdown
-func cliproxyPluginShutdown() {}
+func cliproxyPluginShutdown() {
+	C.store_host_api(nil)
+}
+
+func callHost(method string, payload any) (json.RawMessage, error) {
+	rawPayload, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("marshal host callback payload %s: %w", method, errMarshal)
+	}
+	cMethod := C.CString(method)
+	defer C.free(unsafe.Pointer(cMethod))
+
+	var response C.cliproxy_buffer
+	var requestPtr *C.uint8_t
+	if len(rawPayload) > 0 {
+		cPayload := C.CBytes(rawPayload)
+		if cPayload == nil {
+			return nil, fmt.Errorf("allocate host callback payload %s", method)
+		}
+		defer C.free(cPayload)
+		requestPtr = (*C.uint8_t)(cPayload)
+	}
+	callCode := C.call_host_api(cMethod, requestPtr, C.size_t(len(rawPayload)), &response)
+	var rawResponse []byte
+	if response.ptr != nil && response.len > 0 {
+		rawResponse = C.GoBytes(response.ptr, C.int(response.len))
+	}
+	if response.ptr != nil {
+		C.free_host_buffer(response.ptr, response.len)
+	}
+	if len(rawResponse) == 0 {
+		return nil, fmt.Errorf("host callback %s returned no response, code=%d", method, int(callCode))
+	}
+
+	var env envelope
+	if errUnmarshal := json.Unmarshal(rawResponse, &env); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode host callback envelope %s: %w", method, errUnmarshal)
+	}
+	if !env.OK {
+		if env.Error != nil {
+			return nil, fmt.Errorf("%s: %s", env.Error.Code, env.Error.Message)
+		}
+		return nil, fmt.Errorf("host callback %s failed", method)
+	}
+	if callCode != 0 {
+		return nil, fmt.Errorf("host callback %s returned code=%d", method, int(callCode))
+	}
+	return append(json.RawMessage(nil), env.Result...), nil
+}
 
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
@@ -1066,6 +1139,13 @@ func selectAccount(accounts []accountInfo, req inviteRequest) (accountInfo, erro
 }
 
 func fetchCodexAccounts(req pluginapi.ManagementRequest, explicitOrigin string) ([]accountInfo, error) {
+	if raw, errHost := callHost(hostAuthListMethod, map[string]any{}); errHost == nil {
+		return parseCodexAccounts(raw)
+	}
+	return fetchCodexAccountsViaManagement(req, explicitOrigin)
+}
+
+func fetchCodexAccountsViaManagement(req pluginapi.ManagementRequest, explicitOrigin string) ([]accountInfo, error) {
 	origin, errOrigin := resolveManagementOrigin(req, explicitOrigin)
 	if errOrigin != nil {
 		return nil, errOrigin
@@ -1084,7 +1164,10 @@ func fetchCodexAccounts(req pluginapi.ManagementRequest, explicitOrigin string) 
 	if status != http.StatusOK {
 		return nil, httpStatusError{status: http.StatusBadGateway, msg: fmt.Sprintf("failed to list CPA auth files: status %d", status)}
 	}
+	return parseCodexAccounts(raw)
+}
 
+func parseCodexAccounts(raw []byte) ([]accountInfo, error) {
 	var payload struct {
 		Files []map[string]any `json:"files"`
 	}
@@ -1125,6 +1208,29 @@ func fetchCodexAccounts(req pluginapi.ManagementRequest, explicitOrigin string) 
 }
 
 func fetchCodexCredential(req pluginapi.ManagementRequest, explicitOrigin string, account accountInfo) (codexCredential, error) {
+	if strings.TrimSpace(account.AuthIndex) != "" {
+		raw, errHost := callHost(hostAuthGetMethod, map[string]string{"auth_index": account.AuthIndex})
+		if errHost == nil {
+			var result struct {
+				JSON json.RawMessage `json:"json"`
+			}
+			if errDecode := json.Unmarshal(raw, &result); errDecode != nil {
+				return codexCredential{}, fmt.Errorf("decode host auth get response: %w", errDecode)
+			}
+			credential, errCredential := parseCodexCredential(result.JSON)
+			if errCredential != nil {
+				return codexCredential{}, errCredential
+			}
+			if credential.AccessToken == "" {
+				return codexCredential{}, httpStatusError{status: http.StatusBadRequest, msg: "selected Codex credential does not contain access_token"}
+			}
+			return credential, nil
+		}
+	}
+	return fetchCodexCredentialViaManagement(req, explicitOrigin, account)
+}
+
+func fetchCodexCredentialViaManagement(req pluginapi.ManagementRequest, explicitOrigin string, account accountInfo) (codexCredential, error) {
 	origin, errOrigin := resolveManagementOrigin(req, explicitOrigin)
 	if errOrigin != nil {
 		return codexCredential{}, errOrigin
@@ -1181,8 +1287,19 @@ func normalizeOrigin(raw string) (string, error) {
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return "", fmt.Errorf("unsupported origin scheme")
 	}
-	if parsed.Host == "" {
+	if parsed.User != nil {
+		return "", fmt.Errorf("management origin userinfo is not allowed")
+	}
+	hostname := strings.TrimSpace(parsed.Hostname())
+	if hostname == "" {
 		return "", fmt.Errorf("origin host is required")
+	}
+	isLoopback := strings.EqualFold(hostname, "localhost")
+	if ip := net.ParseIP(hostname); ip != nil {
+		isLoopback = ip.IsLoopback()
+	}
+	if !isLoopback {
+		return "", fmt.Errorf("management origin must use localhost or a loopback IP")
 	}
 	parsed.Path = ""
 	parsed.RawPath = ""
@@ -1204,7 +1321,12 @@ func callLocalManagement(ctx context.Context, origin, method, path, authorizatio
 	if len(body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, errDo := http.DefaultClient.Do(req)
+	client := &http.Client{
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, errDo := client.Do(req)
 	if errDo != nil {
 		return 0, nil, errDo
 	}
