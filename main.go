@@ -495,8 +495,8 @@ func pluginRegistration() registration {
 		Metadata: pluginapi.Metadata{
 			Name:             "Codex Invite",
 			Version:          pluginVersion,
-			Author:           "router-for-me",
-			GitHubRepository: "https://github.com/router-for-me/cpa-plugin-codex-invite",
+			Author:           "Hylouis233",
+			GitHubRepository: "https://github.com/Hylouis233/codex-new-invite",
 		},
 		Capabilities: registrationCapabilities{ManagementAPI: true},
 	}
@@ -760,6 +760,8 @@ type referralsResponse struct {
 	RemainingInvites        any         `json:"remaining_invites,omitempty"`
 	MaxInvites              any         `json:"max_invites,omitempty"`
 	RemainingRewardCapacity any         `json:"remaining_reward_capacity,omitempty"`
+	RemainingInvitesSource  string      `json:"remaining_invites_source,omitempty"`
+	MaxInvitesSource        string      `json:"max_invites_source,omitempty"`
 	Status                  any         `json:"status,omitempty"`
 	UsageEndpointUsed       bool        `json:"usage_endpoint_used,omitempty"`
 	StatusEndpointHit       bool        `json:"status_endpoint_hit,omitempty"`
@@ -862,17 +864,9 @@ func handleProbe(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "endpoints array is required"})
 	}
 
-	account, errAccount := selectQueryAccount(req, payload)
+	credential, account, errAccount := resolveQueryCredential(req, payload)
 	if errAccount != nil {
 		return jsonResponse(statusForError(errAccount), map[string]any{"error": errAccount.Error()})
-	}
-
-	credential, errCredential := fetchCodexCredential(req, payload.ManagementOrigin, account)
-	if errCredential != nil {
-		return jsonResponse(statusForError(errCredential), map[string]any{"error": errCredential.Error()})
-	}
-	if credential.AccountID == "" {
-		credential.AccountID = account.ChatGPTAccountID
 	}
 
 	cfg := normalizeConfig(mergeConfig(currentConfig(), pluginConfig{
@@ -962,6 +956,9 @@ func handleRedeem(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 		return jsonResponse(http.StatusBadRequest, map[string]any{"error": errPayload.Error()})
 	}
 
+	if strings.TrimSpace(payload.AccessToken) == "" && strings.TrimSpace(payload.AuthIndex) == "" && strings.TrimSpace(payload.AuthName) == "" {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "redeem requires an explicit managed account or manual access_token"})
+	}
 	credential, account, errAccount := resolveQueryCredential(req, payload)
 	if errAccount != nil {
 		return jsonResponse(statusForError(errAccount), map[string]any{"error": errAccount.Error()})
@@ -2295,7 +2292,12 @@ func inviteHTTPClient(proxyURL string) (*http.Client, error) {
 		}
 	}
 
-	return &http.Client{Transport: &chatGPTFingerprintTransport{chrome: chromeRT, fallback: fallback}}, nil
+	return &http.Client{
+		Transport: &chatGPTFingerprintTransport{chrome: chromeRT, fallback: fallback},
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}, nil
 }
 
 func inviteEndpoint(baseURL string) (string, error) {
@@ -2619,6 +2621,7 @@ func liftEligibilityFields(result *referralsResponse, raw []byte) referralCapaci
 	// remaining_send_capacity = how many more invites you can send (canonical "invites left").
 	if v, ok := data["remaining_send_capacity"]; ok && v != nil {
 		result.RemainingInvites = v
+		result.RemainingInvitesSource = "invite/eligibility"
 		fields.remaining = true
 	}
 	// remaining_reward_capacity is distinct from the send-cap ceiling.
@@ -2627,6 +2630,7 @@ func liftEligibilityFields(result *referralsResponse, raw []byte) referralCapaci
 	}
 	if v, ok := data["max_send_capacity"]; ok && v != nil {
 		result.MaxInvites = v
+		result.MaxInvitesSource = "invite/eligibility"
 		fields.maximum = true
 	}
 	return fields
@@ -2684,6 +2688,7 @@ func liftReferralFieldsIfMissing(result *referralsResponse, raw []byte, source s
 	} {
 		if value, present := lookupNested(data, key); present && value != nil && !fields.remaining {
 			result.RemainingInvites = value
+			result.RemainingInvitesSource = source
 			fields.remaining = true
 			break
 		}
@@ -2695,6 +2700,7 @@ func liftReferralFieldsIfMissing(result *referralsResponse, raw []byte, source s
 	} {
 		if value, present := lookupNested(data, key); present && value != nil && !fields.maximum {
 			result.MaxInvites = value
+			result.MaxInvitesSource = source
 			fields.maximum = true
 			break
 		}
@@ -3653,12 +3659,35 @@ func renderUsagePage(cfg pluginConfig) string {
           <input id="managementKey" type="password" autocomplete="off" spellcheck="false">
         </label>
         <label>
+          <span data-i18n="account.credentialSource">Credential source</span>
+          <select id="credentialSource" autocomplete="off">
+            <option value="cpa" data-i18n="account.sourceCpa">CPA-managed</option>
+            <option value="manual" data-i18n="account.sourceManual">Manual entry</option>
+          </select>
+        </label>
+        <label>
           <span data-i18n="account.credential">Codex credential</span>
           <select id="account"></select>
+        </label>
+        <label class="manual-credential" hidden>
+          <span data-i18n="account.accessToken">access_token</span>
+          <input id="manualToken" type="password" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="manual-credential" hidden>
+          <span data-i18n="account.accountId">account_id</span>
+          <input id="manualAccountId" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="manual-credential" hidden>
+          <span data-i18n="account.manualEmail">Email (optional)</span>
+          <input id="manualEmail" autocomplete="off" spellcheck="false">
         </label>
         <label>
           <span data-i18n="account.cookie">Browser Cookie (optional)</span>
           <input id="cookie" type="password" autocomplete="off" spellcheck="false">
+        </label>
+        <label>
+          <span data-i18n="account.proxyUrl">Proxy URL (optional)</span>
+          <input id="proxyUrl" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:7890">
         </label>
       </div>
       <div class="actions">
@@ -3684,7 +3713,7 @@ func renderUsagePage(cfg pluginConfig) string {
   </main>
 
   <script>
-    const DEFAULTS = ` + "`" + string(rawDefaults) + "`" + `;
+    const DEFAULTS = ` + string(rawDefaults) + `;
     const settings = Object.assign({ baseURL: 'https://chatgpt.com', language: 'zh-CN', originator: 'Codex Desktop', userAgent: '' }, DEFAULTS);
     const origin = (window.location && window.location.origin) || 'http://127.0.0.1:8317';
     const LOCALE_STORE = 'codex-usage-locale-v1';
@@ -3695,6 +3724,13 @@ func renderUsagePage(cfg pluginConfig) string {
         'account.title': 'Account',
         'account.managementKey': 'CPA management key',
         'account.credential': 'Codex credential',
+        'account.credentialSource': 'Credential source',
+        'account.sourceCpa': 'CPA-managed',
+        'account.sourceManual': 'Manual entry',
+        'account.accessToken': 'access_token',
+        'account.accountId': 'account_id',
+        'account.manualEmail': 'Email (optional)',
+        'account.proxyUrl': 'Proxy URL (optional)',
         'account.cookie': 'Browser Cookie (optional)',
         'account.reload': 'Reload accounts',
         'account.queryUsage': 'Query usage',
@@ -3758,6 +3794,13 @@ func renderUsagePage(cfg pluginConfig) string {
         'account.title': '账号',
         'account.managementKey': 'CPA 管理密钥',
         'account.credential': 'Codex 凭据',
+        'account.credentialSource': '凭据来源',
+        'account.sourceCpa': 'CPA 管理',
+        'account.sourceManual': '手动输入',
+        'account.accessToken': 'access_token',
+        'account.accountId': 'account_id',
+        'account.manualEmail': '邮箱（可选）',
+        'account.proxyUrl': '代理地址（可选）',
         'account.cookie': '浏览器 Cookie（可选）',
         'account.reload': '重新加载账号',
         'account.queryUsage': '查询用量',
@@ -3862,8 +3905,13 @@ func renderUsagePage(cfg pluginConfig) string {
       const authorization = raw.toLowerCase().startsWith('bearer ') ? raw : 'Bearer ' + raw;
       return { Authorization: authorization, 'X-Codex-Invite-Origin': origin };
     }
+    const credentialSource = document.getElementById('credentialSource');
     const accountSelect = document.getElementById('account');
+    const manualTokenInput = document.getElementById('manualToken');
+    const manualAccountIdInput = document.getElementById('manualAccountId');
+    const manualEmailInput = document.getElementById('manualEmail');
     const cookieInput = document.getElementById('cookie');
+    const proxyInput = document.getElementById('proxyUrl');
     const reloadBtn = document.getElementById('reload');
     const usageBtn = document.getElementById('queryUsage');
     const refsBtn = document.getElementById('queryReferrals');
@@ -3874,6 +3922,34 @@ func renderUsagePage(cfg pluginConfig) string {
     const metrics = document.getElementById('metrics');
     const rawPre = document.getElementById('raw');
     const redeemState = { credit_id: '', redeem_request_id: '' };
+
+    function clearRedeemState() {
+      redeemState.credit_id = '';
+      redeemState.redeem_request_id = '';
+    }
+    function manualCredentialMode() {
+      return credentialSource && credentialSource.value === 'manual';
+    }
+    function updateCredentialMode() {
+      const manual = manualCredentialMode();
+      accountSelect.disabled = manual;
+      for (const item of document.querySelectorAll('.manual-credential')) item.hidden = !manual;
+      clearRedeemState();
+    }
+    function currentCredentialPayload() {
+      if (manualCredentialMode()) {
+        const token = manualTokenInput.value.trim();
+        if (!token) return null;
+        return {
+          access_token: token,
+          account_id: manualAccountIdInput.value.trim(),
+          manual_email: manualEmailInput.value.trim()
+        };
+      }
+      const selected = accountSelect.selectedOptions[0];
+      if (!selected || !selected.dataset.name) return null;
+      return { auth_index: selected.value, auth_name: selected.dataset.name || '' };
+    }
 
     function setAccountPlaceholder(message) {
       accountSelect.innerHTML = '';
@@ -3951,20 +4027,19 @@ func renderUsagePage(cfg pluginConfig) string {
       }
     }
     async function queryEndpoint(path, title) {
-      const selected = accountSelect.selectedOptions[0];
-      if (!selected) return;
+      const credentialPayload = currentCredentialPayload();
+      if (!credentialPayload) return;
       usageBtn.disabled = refsBtn.disabled = true;
       try {
-        const payload = {
-          auth_index: selected.value,
-          auth_name: selected.dataset.name || '',
+        const payload = Object.assign({
           base_url: settings.baseURL,
+          proxy_url: proxyInput.value.trim(),
           language: settings.language,
           originator: settings.originator,
           user_agent: settings.userAgent,
           cookie: cookieInput.value.trim(),
           management_origin: origin
-        };
+        }, credentialPayload);
         const response = await fetch(path, {
           method: 'POST',
           headers: Object.assign({}, authHeaders(), { 'Content-Type': 'application/json' }),
@@ -4012,17 +4087,10 @@ func renderUsagePage(cfg pluginConfig) string {
       rows.push([t('metric.account'), (d.account && (d.account.email || d.account.name)) || '—']);
       rows.push([t('metric.remaining'), fmtNumber(d.remaining_invites)]);
       rows.push([t('metric.max'), fmtNumber(d.max_invites)]);
-      if (d.eligibility_endpoint_hit) {
-        rows.push([t('metric.source'), 'invite/eligibility']);
-      } else if (d.tracking_endpoint_hit) {
-        rows.push([t('metric.source'), 'invite/tracking']);
-      } else if (d.usage_endpoint_used) {
-        rows.push([t('metric.source'), t('source.usageFallback')]);
-      } else if (d.status_endpoint_hit) {
-        rows.push([t('metric.source'), t('source.status')]);
-      } else {
-        rows.push([t('metric.source'), d.referrals_credits_endpoint_hit ? t('source.credits') : t('source.usageFallback')]);
-      }
+      const capacitySources = [];
+      if (d.remaining_invites_source) capacitySources.push('remaining: ' + String(d.remaining_invites_source));
+      if (d.max_invites_source && d.max_invites_source !== d.remaining_invites_source) capacitySources.push('max: ' + String(d.max_invites_source));
+      rows.push([t('metric.source'), capacitySources.length ? capacitySources.join('; ') : '—']);
       // Tracking: how many invites sent in past 90 days.
       if (d.tracking_endpoint_hit) {
         rows.push([t('metric.invitesSent'), fmtNumber(d.tracking_invite_count)]);
@@ -4082,18 +4150,28 @@ func renderUsagePage(cfg pluginConfig) string {
       }
       action();
     }
+    function guardCredential(action) {
+      if (manualCredentialMode()) {
+        if (!manualTokenInput.value.trim()) {
+          showResult(t('error.title'), [['message', 'access_token is required in manual credential mode']], { error: 'missing access_token' });
+          return;
+        }
+        action();
+        return;
+      }
+      guardKey(action);
+    }
     async function redeemReward() {
-      const selected = accountSelect.selectedOptions[0];
-      if (!selected) return;
+      const credentialPayload = currentCredentialPayload();
+      if (!credentialPayload) return;
       if (!window.confirm(t('redeem.confirm'))) return;
       redeemBtn.disabled = usageBtn.disabled = refsBtn.disabled = true;
       try {
-        const payload = {
-          auth_index: selected.value,
-          auth_name: selected.dataset.name || '',
+        const payload = Object.assign({
+          proxy_url: proxyInput.value.trim(),
           cookie: cookieInput.value.trim(),
           management_origin: origin
-        };
+        }, credentialPayload);
         if (redeemState.credit_id) payload.credit_id = redeemState.credit_id;
         if (redeemState.redeem_request_id) payload.redeem_request_id = redeemState.redeem_request_id;
         const response = await fetch('/v0/management/codex-invite/redeem', {
@@ -4125,12 +4203,17 @@ func renderUsagePage(cfg pluginConfig) string {
       }
     }
     localeSelect.addEventListener('change', () => changeLocale(localeSelect.value));
+    credentialSource.addEventListener('change', updateCredentialMode);
+    accountSelect.addEventListener('change', clearRedeemState);
+    manualTokenInput.addEventListener('input', clearRedeemState);
+    manualAccountIdInput.addEventListener('input', clearRedeemState);
     reloadBtn.addEventListener('click', () => guardKey(loadAccounts));
-    usageBtn.addEventListener('click', () => guardKey(() => queryEndpoint('/v0/management/codex-invite/usage', 'Usage')));
-    refsBtn.addEventListener('click', () => guardKey(() => queryEndpoint('/v0/management/codex-invite/referrals', 'Referrals')));
-    redeemBtn.addEventListener('click', () => guardKey(redeemReward));
+    usageBtn.addEventListener('click', () => guardCredential(() => queryEndpoint('/v0/management/codex-invite/usage', 'Usage')));
+    refsBtn.addEventListener('click', () => guardCredential(() => queryEndpoint('/v0/management/codex-invite/referrals', 'Referrals')));
+    redeemBtn.addEventListener('click', () => guardCredential(redeemReward));
     clearBtn.addEventListener('click', () => { resultPanel.hidden = true; metrics.innerHTML = ''; rawPre.textContent = ''; });
     applyLocale();
+    updateCredentialMode();
     setAccountPlaceholder(t('account.placeholderKey'));
   </script>
 </body>
