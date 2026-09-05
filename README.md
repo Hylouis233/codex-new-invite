@@ -40,6 +40,17 @@ Fork of [LTbinglingfeng/cpa-plugin-codex-invite](https://github.com/LTbinglingfe
 - **Redeem** a banked rate-limit reset credit — `POST /v0/management/codex-invite/redeem`, which lists banked credits (`GET /backend-api/wham/rate-limit-reset-credits`) and redeems the first available one via `POST /backend-api/wham/rate-limit-reset-credits/consume` (`credit_id` + a generated `redeem_request_id`).
 - This is the step that actually applies an earned referral reward — without redeeming, the credit stays banked and does not restore your rate-limit window.
 
+## Security hardening (v0.3.1)
+
+Ported from the `agent/review-fix-20260827` review branch onto the current feature set:
+
+- **Credential origin pinning** — `base_url` on every request type and in plugin YAML must be exactly `https://chatgpt.com`; credentials can no longer be pointed at an attacker-controlled origin (proxying stays available via `proxy_url`).
+- **No redirect following** — both the ChatGPT upstream client and the CPA management callback client return redirect responses as-is, so Authorization/Cookie headers never leave the intended origin.
+- **Management origin allowlist** — plugin management callbacks only accept loopback, RFC1918 private, and Tailscale CGNAT (100.64/10) origins; public internet origins are rejected (keeps LAN/tailnet CPAMC deployments working).
+- **Redeem requires an explicit account** — the credit-consuming endpoint no longer silently falls back to the first managed credential.
+- **UI XSS fixes** — invite links are `https:`-only without embedded credentials (`safeInviteURL`), the usage page renders all dynamic metrics via `textContent` descriptors, and the management key is no longer persisted to `localStorage`.
+- Registration metadata now points at this fork (Hylouis233 / codex-new-invite).
+
 ## What's new in this fork (v0.2.0)
 
 | Change | Why |

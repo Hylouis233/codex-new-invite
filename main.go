@@ -126,7 +126,7 @@ const (
 	autoAssignProbeTimeout = 20 * time.Second
 )
 
-var pluginVersion = "0.3.0"
+var pluginVersion = "0.3.1"
 
 var (
 	activeConfig atomic.Value
@@ -435,8 +435,8 @@ func pluginRegistration() registration {
 		Metadata: pluginapi.Metadata{
 			Name:             "Codex Invite",
 			Version:          pluginVersion,
-			Author:           "router-for-me",
-			GitHubRepository: "https://github.com/router-for-me/cpa-plugin-codex-invite",
+			Author:           "Hylouis233",
+			GitHubRepository: "https://github.com/Hylouis233/codex-new-invite",
 		},
 		Capabilities: registrationCapabilities{ManagementAPI: true},
 	}
@@ -1325,6 +1325,12 @@ func handleProbe(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 func handleRedeem(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	payload := parseQueryRequest(req.Body)
 
+	// Redeeming consumes a banked credit, so the account must be named explicitly instead
+	// of silently falling back to the first managed credential.
+	if strings.TrimSpace(payload.AuthIndex) == "" && strings.TrimSpace(payload.AuthName) == "" && strings.TrimSpace(payload.AccessToken) == "" {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "explicit managed account required: pass auth_index or auth_name (or an access_token for manual mode)"})
+	}
+
 	credential, account, errAccount := resolveQueryCredential(req, payload)
 	if errAccount != nil {
 		return jsonResponse(statusForError(errAccount), map[string]any{"error": errAccount.Error()})
@@ -1852,6 +1858,12 @@ func fetchCodexAccounts(req pluginapi.ManagementRequest, explicitOrigin string) 
 		return nil, httpStatusError{status: http.StatusBadGateway, msg: fmt.Sprintf("failed to list CPA auth files: status %d", status)}
 	}
 
+	return parseCodexAccounts(raw)
+}
+
+// parseCodexAccounts projects the CPA auth-files listing into the plugin's Codex account
+// view, skipping non-codex, disabled, and malformed entries.
+func parseCodexAccounts(raw []byte) ([]accountInfo, error) {
 	var payload struct {
 		Files []map[string]any `json:"files"`
 	}
@@ -1936,6 +1948,32 @@ func resolveManagementOrigin(req pluginapi.ManagementRequest, explicit string) (
 	return "", httpStatusError{status: http.StatusBadRequest, msg: "management origin is required"}
 }
 
+// managementOriginAllowed reports whether a management origin may receive the CPA
+// management key. Loopback plus private LAN and Tailscale CGNAT ranges are allowed so LAN
+// and tailnet deployments keep working; public internet origins are rejected so
+// credential-bearing callbacks stay on the local network.
+func managementOriginAllowed(hostname string) bool {
+	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	if hostname == "" {
+		return false
+	}
+	if hostname == "localhost" || hostname == "::1" {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(hostname, "[]"))
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return true
+	}
+	// Tailscale / CGNAT range 100.64.0.0/10.
+	if four := ip.To4(); four != nil && four[0] == 100 && four[1] >= 64 && four[1] <= 127 {
+		return true
+	}
+	return false
+}
+
 func normalizeOrigin(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -1951,11 +1989,23 @@ func normalizeOrigin(raw string) (string, error) {
 	if parsed.Host == "" {
 		return "", fmt.Errorf("origin host is required")
 	}
+	if parsed.User != nil {
+		return "", fmt.Errorf("origin must not carry credentials")
+	}
+	if !managementOriginAllowed(parsed.Hostname()) {
+		return "", fmt.Errorf("origin must be a loopback or private network address")
+	}
 	parsed.Path = ""
 	parsed.RawPath = ""
 	parsed.RawQuery = ""
 	parsed.Fragment = ""
 	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+// localManagementClient never follows redirects so the forwarded CPA management key
+// cannot leak to a different origin through a redirect response.
+var localManagementClient = &http.Client{
+	CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
 }
 
 func callLocalManagement(ctx context.Context, origin, method, path, authorization string, body []byte) (int, []byte, error) {
@@ -1971,7 +2021,7 @@ func callLocalManagement(ctx context.Context, origin, method, path, authorizatio
 	if len(body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, errDo := http.DefaultClient.Do(req)
+	resp, errDo := localManagementClient.Do(req)
 	if errDo != nil {
 		return 0, nil, errDo
 	}
@@ -2390,7 +2440,11 @@ func inviteHTTPClient(proxyURL string) (*http.Client, error) {
 		}
 	}
 
-	return &http.Client{Transport: &chatGPTFingerprintTransport{chrome: chromeRT, fallback: fallback}}, nil
+	client := &http.Client{Transport: &chatGPTFingerprintTransport{chrome: chromeRT, fallback: fallback}}
+	// ChatGPT upstream must never redirect credential-bearing requests; surfaces the
+	// redirect response itself instead of silently following it to another origin.
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	return client, nil
 }
 
 func inviteEndpoint(baseURL string) (string, error) {
@@ -3529,8 +3583,21 @@ func renderInvitePage(cfg pluginConfig) string {
       updateEmailCount();
     }
 
-    function splitEmails(text) {
-      return text.split(/[,\s;]+/).map((item) => item.trim()).filter(Boolean);
+	    function splitEmails(text) {
+	      return text.split(/[,\s;]+/).map((item) => item.trim()).filter(Boolean);
+	    }
+
+    // Only https: invite links without embedded credentials become clickable anchors;
+    // anything else (javascript:, http:, user:pass@host) is dropped.
+    function safeInviteURL(raw) {
+      try {
+        const candidate = new URL(String(raw));
+        if (candidate.protocol !== 'https:') return '';
+        if (candidate.username || candidate.password) return '';
+        return candidate.href;
+      } catch (error) {
+        return '';
+      }
     }
 
 	    function updateEmailCount() {
@@ -3615,17 +3682,18 @@ func renderInvitePage(cfg pluginConfig) string {
         });
         const data = await readJSON(response);
         if (!response.ok) throw new Error(formatError(data, t('error.inviteFailed')));
-        const ok = data.ok === true;
-        setStatus(JSON.stringify(data, null, 2), !ok);
-        for (const invite of data.invites || []) {
-          if (!invite.invite_url) continue;
-          const link = document.createElement('a');
-          link.href = invite.invite_url;
-          link.target = '_blank';
-          link.rel = 'noreferrer';
-          link.textContent = (invite.email || 'invite') + ': ' + invite.invite_url;
-          linksBox.appendChild(link);
-        }
+	        const ok = data.ok === true;
+	        setStatus(JSON.stringify(data, null, 2), !ok);
+	        for (const invite of data.invites || []) {
+	          const inviteURL = safeInviteURL(invite.invite_url);
+	          if (!inviteURL) continue;
+	          const link = document.createElement('a');
+	          link.href = inviteURL;
+	          link.target = '_blank';
+	          link.rel = 'noopener noreferrer';
+	          link.textContent = (invite.email || 'invite') + ': ' + inviteURL;
+	          linksBox.appendChild(link);
+	        }
       } catch (error) {
         setStatus(error.message || String(error), true);
       } finally {
@@ -3680,13 +3748,14 @@ func renderInvitePage(cfg pluginConfig) string {
 	        setStatus(head + '\n\n' + JSON.stringify(data, null, 2), !data.ok || (summary.emails_unassigned || 0) > 0);
 	        for (const account of data.accounts || []) {
 	          for (const invite of account.invites || []) {
-	            if (!invite.invite_url) continue;
+	            const inviteURL = safeInviteURL(invite.invite_url);
+	            if (!inviteURL) continue;
 	            const link = document.createElement('a');
-	            link.href = invite.invite_url;
+	            link.href = inviteURL;
 	            link.target = '_blank';
-	            link.rel = 'noreferrer';
+	            link.rel = 'noopener noreferrer';
 	            const owner = (account.account && (account.account.email || account.account.name)) || '';
-	            link.textContent = (invite.email || 'invite') + (owner ? ' @ ' + owner : '') + ': ' + invite.invite_url;
+	            link.textContent = (invite.email || 'invite') + (owner ? ' @ ' + owner : '') + ': ' + inviteURL;
 	            linksBox.appendChild(link);
 	          }
 	        }
@@ -3770,7 +3839,7 @@ func renderUsagePage(cfg pluginConfig) string {
     }
     .metric { display: grid; grid-template-columns: minmax(140px, 220px) 1fr; gap: 8px 16px; align-items: baseline; }
     .metric dt { font-size: 12px; font-weight: 650; opacity: .82; }
-    .metric dd { margin: 0; font-size: 14px; font-weight: 600; word-break: break-word; }
+    .metric dd { margin: 0; font-size: 14px; font-weight: 600; word-break: break-word; white-space: pre-wrap; }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 720; }
     .badge.ok { background: color-mix(in srgb, #10b981 22%, Canvas 78%); color: CanvasText; }
     .badge.warn { background: color-mix(in srgb, #b45309 22%, Canvas 78%); color: CanvasText; }
@@ -3843,10 +3912,9 @@ func renderUsagePage(cfg pluginConfig) string {
   </main>
 
   <script>
-    const DEFAULTS = ` + "`" + string(rawDefaults) + "`" + `;
+    const DEFAULTS = ` + string(rawDefaults) + `;
     const settings = Object.assign({ baseURL: 'https://chatgpt.com', language: 'zh-CN', originator: 'Codex Desktop', userAgent: '' }, DEFAULTS);
     const origin = (window.location && window.location.origin) || 'http://127.0.0.1:8317';
-    const MGMT_KEY_STORE = 'codex-usage-mgmt-key-v1';
     const LOCALE_STORE = 'codex-usage-locale-v1';
     const TRANSLATIONS = {
       en: {
@@ -4050,14 +4118,6 @@ func renderUsagePage(cfg pluginConfig) string {
     }
 
     const keyInput = document.getElementById('managementKey');
-    function storedManagementKey() {
-      try { return localStorage.getItem(MGMT_KEY_STORE) || ''; } catch { return ''; }
-    }
-    function persistManagementKey(value) {
-      try {
-        if (value) { localStorage.setItem(MGMT_KEY_STORE, value); } else { localStorage.removeItem(MGMT_KEY_STORE); }
-      } catch (error) { /* ignore storage failures */ }
-    }
     function authHeaders() {
       const raw = (keyInput && keyInput.value.trim()) || '';
       if (!raw) return {};
@@ -4101,14 +4161,44 @@ func renderUsagePage(cfg pluginConfig) string {
       const n = Number(pct);
       if (!Number.isFinite(n)) return fmtNumber(pct);
       const cls = n >= 90 ? 'err' : n >= 70 ? 'warn' : 'ok';
-      return '<span class="badge ' + cls + '">' + n.toFixed(1) + '%</span>';
+      return { badge: { text: n.toFixed(1) + '%', cls: cls } };
+    }
+    // Metric values are rendered with textContent only; badges are {text, cls} descriptors
+    // so upstream JSON can never inject HTML into the result panel.
+    function metricValue(v) {
+      const dd = document.createElement('dd');
+      if (v && typeof v === 'object') {
+        if (Array.isArray(v.parts)) {
+          v.parts.forEach((part, index) => {
+            if (index) dd.appendChild(document.createTextNode(' | '));
+            if (part && part.badge) {
+              const span = document.createElement('span');
+              span.className = 'badge ' + (part.badge.cls || 'ok');
+              span.textContent = part.badge.text;
+              dd.appendChild(span);
+            } else {
+              dd.appendChild(document.createTextNode(part == null ? '' : String(part)));
+            }
+          });
+          return dd;
+        }
+        if (v.badge) {
+          const span = document.createElement('span');
+          span.className = 'badge ' + (v.badge.cls || 'ok');
+          span.textContent = v.badge.text;
+          dd.appendChild(span);
+        }
+        if (v.text != null) dd.appendChild(document.createTextNode((v.badge ? ' ' : '') + String(v.text)));
+        return dd;
+      }
+      dd.textContent = v == null ? '' : String(v);
+      return dd;
     }
     function setMetric(rows) {
       metrics.innerHTML = '';
       for (const [k, v] of rows) {
         const dt = document.createElement('dt'); dt.textContent = k;
-        const dd = document.createElement('dd'); dd.innerHTML = v;
-        metrics.appendChild(dt); metrics.appendChild(dd);
+        metrics.appendChild(dt); metrics.appendChild(metricValue(v));
       }
     }
     function showResult(title, rows, rawObj) {
@@ -4134,7 +4224,10 @@ func renderUsagePage(cfg pluginConfig) string {
         }
         if (!accountSelect.options.length) accountSelect.innerHTML = '<option>' + t('account.placeholderEmpty') + '</option>';
       } catch (e) {
-        accountSelect.innerHTML = '<option>' + t('account.loadFailed', { error: (e.message || e) }) + '</option>';
+        accountSelect.replaceChildren();
+        const failOpt = document.createElement('option');
+        failOpt.textContent = t('account.loadFailed', { error: (e.message || e) });
+        accountSelect.appendChild(failOpt);
       } finally {
         reloadBtn.disabled = false;
       }
@@ -4180,7 +4273,7 @@ func renderUsagePage(cfg pluginConfig) string {
       const rl = d.rate_limit || {};
       const rc = d.rate_limit_reset_credits || {};
       rows.push([t('metric.account'), (d.account && (d.account.email || d.account.name)) || '—']);
-      rows.push([t('metric.httpStatus'), '<span class="badge ' + (d.ok ? 'ok' : 'err') + '">' + d.status_code + '</span>']);
+      rows.push([t('metric.httpStatus'), { badge: { text: d.status_code, cls: d.ok ? 'ok' : 'err' } }]);
       rows.push([t('metric.creditBalance'), fmtNumber(c.balance)]);
       rows.push([t('metric.subscription'), c.has_subscription ? t('metric.subscriptionYes') : t('metric.subscriptionNo')]);
       if (rl.primary_window) {
@@ -4245,31 +4338,31 @@ func renderUsagePage(cfg pluginConfig) string {
         const status = String(item.status || '');
         const statusCls = status === 'completed' || status === 'accepted' ? 'ok' : (status === 'pending' ? 'warn' : 'err');
         const statusText = (TRANSLATIONS[state.locale] || TRANSLATIONS.en)['status.' + status] ? t('status.' + status) : (status || '—');
-        const parts = ['<span class="badge ' + statusCls + '">' + statusText + '</span>'];
+        const parts = [{ badge: { text: statusText, cls: statusCls } }];
         // Eligibility (has_rewards): decode from invite_url's referral_context.
         const hasRewards = decodeRewardEligible(item.invite_url);
         if (hasRewards === true) {
-          parts.push('<span class="badge ok">' + t('metric.eligible') + '</span>');
+          parts.push({ badge: { text: t('metric.eligible'), cls: 'ok' } });
           eligibleCount += 1;
         } else if (hasRewards === false) {
-          parts.push('<span class="badge err">' + t('metric.noReward') + '</span>');
+          parts.push({ badge: { text: t('metric.noReward'), cls: 'err' } });
         }
-        if (item.expires_at !== undefined && item.expires_at !== null) parts.push(t('metric.expiresAt') + ': ' + fmtTime(item.expires_at));
+        if (item.expires_at !== undefined && item.expires_at !== null) parts.push({ text: t('metric.expiresAt') + ': ' + fmtTime(item.expires_at) });
         // Reward detail: grants inside each tracking item.
         const grants = Array.isArray(item.grants) ? item.grants : [];
         const grantSum = grants.reduce((acc, g) => acc + (Number(g.amount) || 0), 0);
-        if (grants.length) parts.push(t('metric.grantDetail') + ': ' + fmtNumber(grantSum));
+        if (grants.length) parts.push({ text: t('metric.grantDetail') + ': ' + fmtNumber(grantSum) });
         // Resend info.
         if (item.can_resend === true) {
-          parts.push('<span class="badge ok">' + t('metric.canResend') + '</span>');
+          parts.push({ badge: { text: t('metric.canResend'), cls: 'ok' } });
         } else if (item.resend_available_at !== undefined && item.resend_available_at !== null) {
-          parts.push(t('metric.resendAt') + ': ' + fmtTime(item.resend_available_at));
+          parts.push({ text: t('metric.resendAt') + ': ' + fmtTime(item.resend_available_at) });
         }
-        rows.push([t('metric.pendingInvites') + ': ' + email, parts.join(' &nbsp;|&nbsp; ')]);
+        rows.push([t('metric.pendingInvites') + ': ' + email, { parts: parts }]);
       }
       // Eligible-account summary (has_rewards=True).
       if (trackItems.length) {
-        rows.push([t('metric.eligibleCount'), '<strong class="ok">' + eligibleCount + '</strong> / ' + trackItems.length]);
+        rows.push([t('metric.eligibleCount'), { parts: [{ badge: { text: eligibleCount, cls: 'ok' } }, { text: '/ ' + trackItems.length }] }]);
       }
       // Eligibility hit → remaining_reward_capacity is the "max rewards left" ceiling.
       if (d.eligibility_endpoint_hit && d.max_invites != null) {
@@ -4278,8 +4371,8 @@ func renderUsagePage(cfg pluginConfig) string {
       // Eligibility reward details (title, description, per-side grant amounts, rules).
       if (d.eligibility_endpoint_hit && d.eligibility && typeof d.eligibility === 'object') {
         const el = d.eligibility;
-        if (el.title) rows.push([t('metric.offerTitle'), '<strong>' + String(el.title) + '</strong>']);
-        if (el.description) rows.push([t('metric.offerDesc'), '<span style="white-space:pre-wrap">' + String(el.description) + '</span>']);
+        if (el.title) rows.push([t('metric.offerTitle'), String(el.title)]);
+        if (el.description) rows.push([t('metric.offerDesc'), String(el.description)]);
         if (Array.isArray(el.grants)) {
           for (const g of el.grants) {
             if (g.recipient === 'referrer') rows.push([t('metric.referrerReward'), fmtNumber(g.amount) + ' ' + (g.grant_type === 'personal_credits' ? t('metric.creditBalance').replace(/Balance|余额/, '').trim() : g.grant_type || '')]);
@@ -4287,7 +4380,7 @@ func renderUsagePage(cfg pluginConfig) string {
           }
         }
         if (Array.isArray(el.rules) && el.rules.length > 0) {
-          rows.push([t('metric.rules'), '<span style="white-space:pre-wrap">' + el.rules.map(r => '• ' + r).join('\n') + '</span>']);
+          rows.push([t('metric.rules'), el.rules.map(r => '• ' + r).join('\n')]);
         }
       }
       // Banked reset-credits from the dedicated endpoint (/wham/rate-limit-reset-credits) —
@@ -4305,7 +4398,7 @@ func renderUsagePage(cfg pluginConfig) string {
         if (st.plan_type) rows.push([t('metric.planType'), String(st.plan_type)]);
         const rl = st.rate_limit || {};
         const limitReached = rl.limit_reached === true || (rl.primary_window && Number(rl.primary_window.used_percent) >= 100);
-        rows.push([t('metric.rateLimitStatus'), '<span class="badge ' + (limitReached ? 'err' : 'ok') + '">' + (limitReached ? t('metric.rateLimitExhausted') : t('metric.rateLimitActive')) + '</span>']);
+        rows.push([t('metric.rateLimitStatus'), { badge: { text: limitReached ? t('metric.rateLimitExhausted') : t('metric.rateLimitActive'), cls: limitReached ? 'err' : 'ok' } }]);
         const pw = rl.primary_window || {};
         if (pw.reset_at) rows.push([t('metric.rateLimitReset'), fmtEpoch(pw.reset_at)]);
         if (!d.reset_credits_endpoint_hit) {
@@ -4315,7 +4408,7 @@ func renderUsagePage(cfg pluginConfig) string {
         const cr = st.credits || {};
         if (typeof cr.has_credits === 'boolean') rows.push([t('metric.hasCredits'), cr.has_credits ? t('metric.subscriptionYes') : t('metric.subscriptionNo')]);
       }
-      if (d.note) rows.push([t('metric.note'), '<span style="white-space:pre-wrap">' + d.note + '</span>']);
+      if (d.note) rows.push([t('metric.note'), d.note]);
       showResult(t('referrals.titleSuffix', { name: accountName(d) }), rows, d);
     }
 
@@ -4449,13 +4542,10 @@ func renderUsagePage(cfg pluginConfig) string {
       }));
     }
     clearBtn.addEventListener('click', () => { resultPanel.hidden = true; metrics.innerHTML = ''; rawPre.textContent = ''; });
-    keyInput.addEventListener('input', () => persistManagementKey(keyInput.value.trim()));
 
     applyLocale();
-    // Restore a previously saved key and auto-load accounts only when present.
-    const savedKey = storedManagementKey();
-    if (savedKey) { keyInput.value = savedKey; loadAccounts(); }
-    else { accountSelect.innerHTML = '<option>' + t('account.placeholderKey') + '</option>'; }
+    // The management key is intentionally not persisted; it is re-entered per session.
+    accountSelect.innerHTML = '<option>' + t('account.placeholderKey') + '</option>';
   </script>
 </body>
 </html>`
