@@ -77,6 +77,7 @@ const (
 	managementAccountsPath        = "/v0/management/codex-invite/accounts"
 	managementInvitePath          = "/v0/management/codex-invite/invite"
 	managementAutoAssignPath      = "/v0/management/codex-invite/auto-assign"
+	managementDispatchPath        = "/v0/management/codex-invite/dispatch"
 	managementUsagePath           = "/v0/management/codex-invite/usage"
 	managementReferralsPath       = "/v0/management/codex-invite/referrals"
 	managementProbePath           = "/v0/management/codex-invite/probe"
@@ -124,9 +125,19 @@ const (
 	// autoAssignProbeTimeout bounds each per-account upstream probe; the overall budget is
 	// larger so many accounts can still be scanned sequentially.
 	autoAssignProbeTimeout = 20 * time.Second
+	// defaultCDKSiteURL is the CDK redemption site whose lookup/use/status API drives the
+	// dispatch flow. CDKs are credentials, so the site URL is fixed in plugin config and
+	// can never be overridden per request.
+	defaultCDKSiteURL = "https://abc.dpzxsm.qzz.io"
+	// dispatchPollInterval / dispatchPollTimeout bound the per-CDK redemption wait.
+	dispatchPollInterval = 10 * time.Second
+	dispatchPollTimeout = 5 * time.Minute
+	// trackingCapacityWindow matches the monthly quota window; tracking items older than
+	// this are excluded from the assumed-capacity estimate (they belong to a prior cycle).
+	trackingCapacityWindow = 31 * 24 * time.Hour
 )
 
-var pluginVersion = "0.3.1"
+var pluginVersion = "0.4.0"
 
 var (
 	activeConfig atomic.Value
@@ -182,6 +193,9 @@ type pluginConfig struct {
 	UserAgent           string `yaml:"user_agent"`
 	Cookie              string `yaml:"cookie"`
 	MaxEmailsPerRequest int    `yaml:"max_emails_per_request"`
+	// CDKSiteURL is the card-redemption site used by the dispatch endpoint. CDKs are
+	// credentials, so only this configured origin ever receives them.
+	CDKSiteURL string `yaml:"cdk_site_url"`
 }
 
 type accountInfo struct {
@@ -306,6 +320,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			{Method: http.MethodGet, Path: "/codex-invite/accounts"},
 			{Method: http.MethodPost, Path: "/codex-invite/invite"},
 				{Method: http.MethodPost, Path: "/codex-invite/auto-assign"},
+				{Method: http.MethodPost, Path: "/codex-invite/dispatch"},
 				{Method: http.MethodPost, Path: "/codex-invite/usage"},
 				{Method: http.MethodPost, Path: "/codex-invite/referrals"},
 				{Method: http.MethodPost, Path: "/codex-invite/probe"},
@@ -362,6 +377,7 @@ func defaultConfig() pluginConfig {
 		Originator:          defaultOriginator,
 		UserAgent:           defaultUserAgent,
 		MaxEmailsPerRequest: defaultMaxEmails,
+		CDKSiteURL:          defaultCDKSiteURL,
 	}
 }
 
@@ -386,6 +402,9 @@ func mergeConfig(base, override pluginConfig) pluginConfig {
 	}
 	if override.MaxEmailsPerRequest != 0 {
 		base.MaxEmailsPerRequest = override.MaxEmailsPerRequest
+	}
+	if strings.TrimSpace(override.CDKSiteURL) != "" {
+		base.CDKSiteURL = override.CDKSiteURL
 	}
 	return base
 }
@@ -417,6 +436,13 @@ func normalizeConfig(cfg pluginConfig) pluginConfig {
 	}
 	if cfg.MaxEmailsPerRequest > upperMaxEmails {
 		cfg.MaxEmailsPerRequest = upperMaxEmails
+	}
+	cfg.CDKSiteURL = strings.TrimRight(strings.TrimSpace(cfg.CDKSiteURL), "/")
+	if cfg.CDKSiteURL == "" {
+		cfg.CDKSiteURL = defaultCDKSiteURL
+	}
+	if !strings.HasPrefix(strings.ToLower(cfg.CDKSiteURL), "https://") {
+		cfg.CDKSiteURL = defaultCDKSiteURL
 	}
 	return cfg
 }
@@ -464,6 +490,8 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return okEnvelope(handleInvite(req.ManagementRequest))
 	case strings.EqualFold(req.Method, http.MethodPost) && path == managementAutoAssignPath:
 		return okEnvelope(handleAutoAssign(req.ManagementRequest))
+	case strings.EqualFold(req.Method, http.MethodPost) && path == managementDispatchPath:
+		return okEnvelope(handleDispatch(req.ManagementRequest))
 	case (strings.EqualFold(req.Method, http.MethodGet) || strings.EqualFold(req.Method, http.MethodPost)) && path == managementUsagePath:
 		return okEnvelope(handleUsage(req.ManagementRequest))
 	case (strings.EqualFold(req.Method, http.MethodGet) || strings.EqualFold(req.Method, http.MethodPost)) && path == managementReferralsPath:
@@ -891,7 +919,10 @@ func capacityFromEligibility(raw []byte) (int, bool) {
 }
 
 // inviteCountFromTracking counts sent-invite records (items with an email) from an
-// invite/tracking body.
+// invite/tracking body. Only records newer than the monthly quota window are counted —
+// the tracking feed spans 90 days but the send/reward quota resets monthly, so stale
+// records would otherwise understate the remaining capacity. Items without a parsable
+// created_at are still counted (conservative).
 func inviteCountFromTracking(raw []byte) (int, bool) {
 	var data struct {
 		Items []map[string]any `json:"items"`
@@ -899,11 +930,21 @@ func inviteCountFromTracking(raw []byte) (int, bool) {
 	if errJSON := json.Unmarshal(raw, &data); errJSON != nil {
 		return 0, false
 	}
+	cutoff := time.Now().Add(-trackingCapacityWindow)
 	count := 0
 	for _, item := range data.Items {
-		if _, ok := item["email"]; ok {
-			count++
+		if _, ok := item["email"]; !ok {
+			continue
 		}
+		created, _ := item["created_at"].(string)
+		if created == "" {
+			count++
+			continue
+		}
+		if parsed, errParse := time.Parse(time.RFC3339, created); errParse == nil && parsed.Before(cutoff) {
+			continue
+		}
+		count++
 	}
 	return count, true
 }
@@ -998,6 +1039,310 @@ func chunkEmails(emails []string, size int) [][]string {
 		chunks = append(chunks, emails[start:end])
 	}
 	return chunks
+}
+
+// dispatchRequest drives the CDK-site redemption flow end to end: for each CDK it looks
+// up the bound email on the configured card site, sends an invite from the selected
+// Codex account, triggers the site's auto-accept, and waits for redemption.
+type dispatchRequest struct {
+	CDKs               []string `json:"cdks,omitempty"`
+	CDKsText           string   `json:"cdks_text,omitempty"`
+	AuthIndex          string   `json:"auth_index,omitempty"`
+	AuthName           string   `json:"auth_name,omitempty"`
+	ReferralKey        string   `json:"referral_key,omitempty"`
+	BaseURL            string   `json:"base_url,omitempty"`
+	ProxyURL           string   `json:"proxy_url,omitempty"`
+	Language           string   `json:"language,omitempty"`
+	Originator         string   `json:"originator,omitempty"`
+	UserAgent          string   `json:"user_agent,omitempty"`
+	Cookie             string   `json:"cookie,omitempty"`
+	DryRun             bool     `json:"dry_run,omitempty"`
+	PollTimeoutSeconds int      `json:"poll_timeout_seconds,omitempty"`
+	ManagementOrigin   string   `json:"management_origin,omitempty"`
+}
+
+// dispatchResult is one CDK's outcome through the lookup → invite → use → poll chain.
+type dispatchResult struct {
+	CDK        string         `json:"cdk"`
+	Email      string         `json:"email,omitempty"`
+	SiteStatus string         `json:"site_status,omitempty"`
+	Status     string         `json:"status"` // planned | sent | redeemed | skipped | failed
+	Invite     *inviteResponse `json:"invite,omitempty"`
+	Error      string         `json:"error,omitempty"`
+}
+
+type dispatchResponse struct {
+	OK       bool             `json:"ok"`
+	DryRun   bool             `json:"dry_run"`
+	Account  accountInfo      `json:"account"`
+	Site     string           `json:"site"`
+	Results  []dispatchResult `json:"results"`
+	Summary  dispatchSummary  `json:"summary"`
+}
+
+type dispatchSummary struct {
+	CDKsTotal    int `json:"cdks_total"`
+	CDKsRedeemed int `json:"cdks_redeemed"`
+	CDKsPlanned  int `json:"cdks_planned"`
+	CDKsSkipped  int `json:"cdks_skipped"`
+	CDKsFailed   int `json:"cdks_failed"`
+}
+
+// cdkSiteCall posts a JSON body to one of the card site's /api/* endpoints and decodes
+// the response envelope {email, status, error, ...}.
+func cdkSiteCall(ctx context.Context, client *http.Client, siteURL, path string, body map[string]string) (map[string]any, int, error) {
+	raw, errMarshal := json.Marshal(body)
+	if errMarshal != nil {
+		return nil, 0, errMarshal
+	}
+	req, errRequest := http.NewRequestWithContext(ctx, http.MethodPost, siteURL+path, bytes.NewReader(raw))
+	if errRequest != nil {
+		return nil, 0, errRequest
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	resp, errDo := client.Do(req)
+	if errDo != nil {
+		return nil, 0, errDo
+	}
+	defer func() { _ = resp.Body.Close() }()
+	payload, errRead := readLimited(resp.Body, upstreamBodyLimit)
+	if errRead != nil {
+		return nil, resp.StatusCode, errRead
+	}
+	var decoded map[string]any
+	if len(payload) > 0 {
+		_ = json.Unmarshal(payload, &decoded)
+	}
+	return decoded, resp.StatusCode, nil
+}
+
+func handleDispatch(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	if len(req.Body) > maxManagementBodyBytes {
+		return jsonResponse(http.StatusRequestEntityTooLarge, map[string]any{"error": "request body is too large"})
+	}
+	var payload dispatchRequest
+	if errUnmarshal := json.Unmarshal(req.Body, &payload); errUnmarshal != nil {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "invalid JSON request body"})
+	}
+
+	cdks := collectCDKs(payload.CDKs, payload.CDKsText)
+	if len(cdks) == 0 {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "at least one CDK is required"})
+	}
+	if len(cdks) > upperMaxEmails {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("too many CDKs: got %d, max %d", len(cdks), upperMaxEmails)})
+	}
+
+	cfg := currentConfig()
+	requestCfg := normalizeConfig(mergeConfig(cfg, pluginConfig{
+		BaseURL:    payload.BaseURL,
+		Language:   payload.Language,
+		Originator: payload.Originator,
+		UserAgent:  payload.UserAgent,
+	}))
+	referralKey := strings.TrimSpace(payload.ReferralKey)
+	if referralKey == "" {
+		referralKey = requestCfg.ReferralKey
+	}
+	cookie := strings.TrimSpace(payload.Cookie)
+	proxyURL := strings.TrimSpace(payload.ProxyURL)
+	pollTimeout := time.Duration(payload.PollTimeoutSeconds) * time.Second
+	if pollTimeout <= 0 || pollTimeout > dispatchPollTimeout {
+		pollTimeout = dispatchPollTimeout
+	}
+
+	// The inviting account must be named explicitly: dispatch consumes reward quota.
+	accounts, errAccounts := fetchCodexAccounts(req, payload.ManagementOrigin)
+	if errAccounts != nil {
+		return jsonResponse(statusForError(errAccounts), map[string]any{"error": errAccounts.Error()})
+	}
+	account, errAccount := selectAccount(accounts, inviteRequest{AuthIndex: payload.AuthIndex, AuthName: payload.AuthName})
+	if errAccount != nil {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": errAccount.Error()})
+	}
+	credential, errCredential := fetchCodexCredential(req, payload.ManagementOrigin, account)
+	if errCredential != nil {
+		return jsonResponse(statusForError(errCredential), map[string]any{"error": errCredential.Error()})
+	}
+	if credential.AccountID == "" {
+		credential.AccountID = account.ChatGPTAccountID
+	}
+
+	siteClient, errClient := inviteHTTPClient(proxyURL)
+	if errClient != nil {
+		return jsonResponse(http.StatusInternalServerError, map[string]any{"error": errClient.Error()})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(len(cdks))*(pollTimeout+45*time.Second))
+	defer cancel()
+
+	response := dispatchResponse{
+		OK:      true,
+		DryRun:  payload.DryRun,
+		Account: account,
+		Site:    requestCfg.CDKSiteURL,
+	}
+	for _, cdk := range cdks {
+		result := dispatchResult{CDK: cdk}
+
+		// 1. lookup — resolve the bound email; anything not "ready" is skipped so a
+		//    partially-used or invalid CDK never burns an invite.
+		lookupCtx, lookupCancel := context.WithTimeout(ctx, 30*time.Second)
+		info, status, errLookup := cdkSiteCall(lookupCtx, siteClient, requestCfg.CDKSiteURL, "/api/lookup", map[string]string{"cdk": cdk})
+		lookupCancel()
+		if errLookup != nil {
+			result.Status = "failed"
+			result.Error = "lookup: " + errLookup.Error()
+			response.Results = append(response.Results, result)
+			continue
+		}
+		if status != http.StatusOK {
+			result.Status = "failed"
+			result.Error = fmt.Sprintf("lookup: HTTP %d", status)
+			response.Results = append(response.Results, result)
+			continue
+		}
+		result.Email, _ = info["email"].(string)
+		result.SiteStatus, _ = info["status"].(string)
+		if siteStatus := result.SiteStatus; siteStatus != "ready" {
+			result.Status = "skipped"
+			result.Error = fmt.Sprintf("cdk status %q is not ready", siteStatus)
+			response.Results = append(response.Results, result)
+			continue
+		}
+		if !emailPattern.MatchString(result.Email) {
+			result.Status = "failed"
+			result.Error = "lookup returned no valid email"
+			response.Results = append(response.Results, result)
+			continue
+		}
+
+		if payload.DryRun {
+			result.Status = "planned"
+			response.Results = append(response.Results, result)
+			continue
+		}
+
+		// 2. invite from the selected account.
+		inviteCtx, inviteCancel := context.WithTimeout(ctx, 45*time.Second)
+		invite, errInvite := sendInvite(inviteCtx, requestCfg, credential, account, []string{result.Email}, referralKey, cookie, proxyURL)
+		inviteCancel()
+		if errInvite != nil || !invite.OK {
+			result.Status = "failed"
+			if errInvite != nil {
+				result.Error = "invite: " + errInvite.Error()
+			} else {
+				result.Error = fmt.Sprintf("invite: upstream status %d", invite.StatusCode)
+			}
+			response.Results = append(response.Results, result)
+			continue
+		}
+		result.Status = "sent"
+		result.Invite = &invite
+
+		// 3. trigger the site's auto-accept.
+		useCtx, useCancel := context.WithTimeout(ctx, 45*time.Second)
+		useInfo, useStatus, errUse := cdkSiteCall(useCtx, siteClient, requestCfg.CDKSiteURL, "/api/use", map[string]string{"cdk": cdk})
+		useCancel()
+		if errUse != nil || useStatus != http.StatusOK {
+			result.Status = "sent"
+			if errUse != nil {
+				result.Error = "use: " + errUse.Error()
+			} else {
+				result.Error = fmt.Sprintf("use: HTTP %d", useStatus)
+			}
+			response.Results = append(response.Results, result)
+			continue
+		}
+		if errMsg, _ := useInfo["error"].(string); errMsg != "" {
+			result.Status = "sent"
+			result.Error = "use: " + errMsg
+			response.Results = append(response.Results, result)
+			continue
+		}
+
+		// 4. poll until the site reports success/failure or the timeout hits. The invite
+		//    itself already succeeded at this point, so a poll timeout is not a hard fail.
+		deadline := time.Now().Add(pollTimeout)
+		for {
+			pollCtx, pollCancel := context.WithTimeout(ctx, 30*time.Second)
+			pollInfo, pollStatus, errPoll := cdkSiteCall(pollCtx, siteClient, requestCfg.CDKSiteURL, "/api/status", map[string]string{"cdk": cdk})
+			pollCancel()
+			if errPoll == nil && pollStatus == http.StatusOK {
+				state, _ := pollInfo["status"].(string)
+				result.SiteStatus = state
+				switch state {
+				case "success":
+					result.Status = "redeemed"
+				case "error", "failed":
+					result.Status = "failed"
+					if errMsg, _ := pollInfo["error"].(string); errMsg != "" {
+						result.Error = "site: " + errMsg
+					}
+				}
+				if result.Status == "redeemed" || result.Status == "failed" {
+					break
+				}
+			}
+			if time.Now().After(deadline) {
+				if result.Status == "sent" {
+					result.Error = "poll timed out waiting for site redemption; invite was sent"
+				}
+				break
+			}
+			select {
+			case <-ctx.Done():
+				if result.Status == "sent" {
+					result.Error = "poll canceled; invite was sent"
+				}
+				goto done
+			case <-time.After(dispatchPollInterval):
+			}
+		}
+	done:
+		response.Results = append(response.Results, result)
+	}
+
+	for _, result := range response.Results {
+		switch result.Status {
+		case "redeemed":
+			response.Summary.CDKsRedeemed++
+		case "planned":
+			response.Summary.CDKsPlanned++
+		case "skipped":
+			response.Summary.CDKsSkipped++
+		case "failed":
+			response.Summary.CDKsFailed++
+		}
+	}
+	response.Summary.CDKsTotal = len(cdks)
+	return jsonResponse(http.StatusOK, response)
+}
+
+// collectCDKs merges a CDK array and free-form text, normalizing case and dropping
+// duplicates while preserving order.
+func collectCDKs(cdkList []string, cdkText string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0)
+	add := func(raw string) {
+		for _, item := range splitEmailList(raw) {
+			cdk := strings.ToUpper(strings.TrimSpace(item))
+			if cdk == "" {
+				continue
+			}
+			if _, exists := seen[cdk]; exists {
+				continue
+			}
+			seen[cdk] = struct{}{}
+			out = append(out, cdk)
+		}
+	}
+	for _, item := range cdkList {
+		add(item)
+	}
+	add(cdkText)
+	return out
 }
 
 // queryRequest is the shared input shape for the usage and referrals query endpoints.
@@ -3272,6 +3617,23 @@ func renderInvitePage(cfg pluginConfig) string {
           </span>
         </div>
       </section>
+      <section class="panel">
+        <h2 data-i18n="dispatch.title">CDK dispatch (card site)</h2>
+        <div class="fields">
+          <label><span data-i18n="dispatch.cdkList">CDKs (one per line)</span>
+            <textarea id="cdkText" spellcheck="false" data-i18n-placeholder="dispatch.cdkPlaceholder" placeholder="CA-XXXX-XXXX-XXXX-XXXX"></textarea>
+          </label>
+          <div class="actions">
+            <button id="previewDispatch" type="button" class="secondary" data-i18n="dispatch.preview">Preview CDKs</button>
+            <button id="runDispatch" type="button" data-i18n="dispatch.send">Dispatch CDKs</button>
+          </div>
+          <span class="muted" data-i18n="dispatch.hint">
+            Uses the selected account above. For each CDK: look up its bound email on the
+            card site, send the invite, trigger auto-accept, and wait for redemption.
+            Non-ready CDKs are skipped; a failed invite never consumes the CDK.
+          </span>
+        </div>
+      </section>
     </div>
     <section id="status" class="status" hidden></section>
     <section id="links" class="links"></section>
@@ -3319,6 +3681,15 @@ func renderInvitePage(cfg pluginConfig) string {
 	        'auto.hint': 'Uses the emails above. Every active account is sorted by remaining invite quota (eligibility → tracking estimate → assumed capacity) and filled from the highest quota down; failed sends roll over to the next account automatically.',
 	        'auto.summary': '{sent}/{requested} invites sent · {unassigned} unassigned · {accounts} eligible accounts',
 	        'auto.previewSummary': 'DRY RUN — plan: {assigned}/{requested} assigned · {unassigned} unassigned · {accounts} eligible accounts',
+	        'dispatch.title': 'CDK dispatch (card site)',
+	        'dispatch.cdkList': 'CDKs (one per line)',
+	        'dispatch.cdkPlaceholder': 'CA-XXXX-XXXX-XXXX-XXXX',
+	        'dispatch.preview': 'Preview CDKs',
+	        'dispatch.send': 'Dispatch CDKs',
+	        'dispatch.hint': 'Uses the selected account above. For each CDK: look up its bound email on the card site, send the invite, trigger auto-accept, and wait for redemption. Non-ready CDKs are skipped; a failed invite never consumes the CDK.',
+	        'dispatch.summary': 'CDKs: {total} · redeemed {redeemed} · planned {planned} · skipped {skipped} · failed {failed}',
+	        'dispatch.previewSummary': 'DRY RUN — CDKs: {total} · ready {planned} · not ready {skipped} · failed {failed}',
+	        'error.selectAccountForDispatch': 'Select a Codex account for CDK dispatch',
         'email.countOne': '{count} email',
         'email.countOther': '{count} emails',
         'account.none': 'No Codex accounts loaded',
@@ -3371,6 +3742,15 @@ func renderInvitePage(cfg pluginConfig) string {
 	        'auto.hint': '使用上方填写的邮箱。自动查询所有活跃账号的剩余邀请额度（优先 eligibility 精确值，其次按已发送数估算，最后用假定配额），从额度最高的账号开始分配；发送失败会自动顺延到下一个账号。',
 	        'auto.summary': '已发送 {sent}/{requested} · 未分配 {unassigned} · 可邀账号 {accounts} 个',
 	        'auto.previewSummary': '预演：分配 {assigned}/{requested} · 未分配 {unassigned} · 可邀账号 {accounts} 个',
+	        'dispatch.title': 'CDK 派发（卡密站）',
+	        'dispatch.cdkList': '卡密（每行一个）',
+	        'dispatch.cdkPlaceholder': 'CA-XXXX-XXXX-XXXX-XXXX',
+	        'dispatch.preview': '预览卡密（不发送）',
+	        'dispatch.send': '派发卡密',
+	        'dispatch.hint': '使用上方选定的账号。每张卡密：在卡密站查询绑定邮箱 → 发送邀请 → 触发自动接受 → 等待兑换完成。非 ready 状态的卡密自动跳过；邀请发送失败不会消耗卡密。',
+	        'dispatch.summary': '卡密 {total} 张 · 已兑换 {redeemed} · 预演 {planned} · 跳过 {skipped} · 失败 {failed}',
+	        'dispatch.previewSummary': '预演：卡密 {total} 张 · 可用 {planned} · 不可用 {skipped} · 失败 {failed}',
+	        'error.selectAccountForDispatch': '请先选择用于 CDK 派发的 Codex 账号',
         'email.countOne': '{count} 个邮箱',
         'email.countOther': '{count} 个邮箱',
         'account.none': '未加载 Codex 账号',
@@ -3424,6 +3804,8 @@ func renderInvitePage(cfg pluginConfig) string {
     const clearResultButton = field('clearResult');
     const previewAssignButton = field('previewAssign');
     const autoAssignButton = field('autoAssign');
+    const previewDispatchButton = field('previewDispatch');
+    const runDispatchButton = field('runDispatch');
     const accountCount = field('accountCount');
     const emailCount = field('emailCount');
     const credMode = field('credMode');
@@ -3613,6 +3995,10 @@ func renderInvitePage(cfg pluginConfig) string {
 	      const autoOk = count > 0 && !manual;
 	      previewAssignButton.disabled = !autoOk;
 	      autoAssignButton.disabled = !autoOk;
+	      // CDK dispatch needs both a selected account (it consumes reward quota) and CDKs.
+	      const cdkOk = !manual && hasTarget && splitEmails(field('cdkText').value).length > 0;
+	      previewDispatchButton.disabled = !cdkOk;
+	      runDispatchButton.disabled = !cdkOk;
 	    }
 
     function renderAccounts(accounts) {
@@ -3766,6 +4152,60 @@ func renderInvitePage(cfg pluginConfig) string {
 	      }
 	    }
 
+    // runDispatch drives the CDK site flow for the selected account: lookup → invite →
+    // use → poll. dryRun=true only looks the CDKs up and previews which are ready.
+	    async function runDispatch(dryRun) {
+	      clearResult();
+	      const button = dryRun ? previewDispatchButton : runDispatchButton;
+	      button.disabled = true;
+	      try {
+	        const settings = getSettings();
+	        const selected = accountSelect.selectedOptions[0];
+	        if (!selected) throw new Error(t('error.selectAccountForDispatch'));
+	        const payload = {
+	          cdks_text: field('cdkText').value,
+	          auth_index: selected.value,
+	          auth_name: selected.dataset.name || '',
+	          dry_run: dryRun,
+	          referral_key: settings.referral_key,
+	          base_url: settings.base_url,
+	          proxy_url: settings.proxy_url,
+	          language: settings.language,
+	          originator: settings.originator,
+	          user_agent: settings.user_agent,
+	          cookie: field('cookie').value,
+	          management_origin: origin
+	        };
+	        const response = await fetch('/v0/management/codex-invite/dispatch', {
+	          method: 'POST',
+	          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+	          body: JSON.stringify(payload)
+	        });
+	        const data = await readJSON(response);
+	        if (!response.ok) throw new Error(formatError(data, t('error.inviteFailed')));
+	        const s = data.summary || {};
+	        const head = dryRun
+	          ? t('dispatch.previewSummary', { total: s.cdks_total || 0, planned: s.cdks_planned || 0, skipped: s.cdks_skipped || 0, failed: s.cdks_failed || 0 })
+	          : t('dispatch.summary', { total: s.cdks_total || 0, redeemed: s.cdks_redeemed || 0, planned: s.cdks_planned || 0, skipped: s.cdks_skipped || 0, failed: s.cdks_failed || 0 });
+	        setStatus(head + '\n\n' + JSON.stringify(data, null, 2), !data.ok || (s.cdks_failed || 0) > 0);
+	        for (const result of data.results || []) {
+	          const first = result.invite && (result.invite.invites || [])[0];
+	          const inviteURL = safeInviteURL(first && first.invite_url);
+	          if (!inviteURL) continue;
+	          const link = document.createElement('a');
+	          link.href = inviteURL;
+	          link.target = '_blank';
+	          link.rel = 'noopener noreferrer';
+	          link.textContent = (result.email || result.cdk) + ': ' + inviteURL;
+	          linksBox.appendChild(link);
+	        }
+	      } catch (error) {
+	        setStatus(error.message || String(error), true);
+	      } finally {
+	        updateEmailCount();
+	      }
+	    }
+
     localeSelect.addEventListener('change', () => changeLocale(localeSelect.value));
 	    loadButton.addEventListener('click', loadAccounts);
 	    saveLocalButton.addEventListener('click', saveLocalSettings);
@@ -3774,7 +4214,10 @@ func renderInvitePage(cfg pluginConfig) string {
 	    clearResultButton.addEventListener('click', clearResult);
 	    previewAssignButton.addEventListener('click', () => runAutoAssign(true));
 	    autoAssignButton.addEventListener('click', () => runAutoAssign(false));
+	    previewDispatchButton.addEventListener('click', () => runDispatch(true));
+	    runDispatchButton.addEventListener('click', () => runDispatch(false));
 	    field('emails').addEventListener('input', updateEmailCount);
+	    field('cdkText').addEventListener('input', updateEmailCount);
 	    accountSelect.addEventListener('change', updateEmailCount);
     renderAccounts([]);
     applyLocale();

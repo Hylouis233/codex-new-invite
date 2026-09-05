@@ -71,18 +71,23 @@ func (request *queryRequest) UnmarshalJSON(data []byte) error {
 
 // UnmarshalYAML applies the same restriction to lifecycle configuration. A
 // custom network path should use proxy_url rather than replacing the upstream
-// origin that receives Authorization and Cookie headers.
+// origin that receives Authorization and Cookie headers. Unlike request decoding,
+// an invalid configured base_url downgrades to the canonical origin instead of
+// failing the whole plugin load — YAML config is operator-controlled and one
+// stale field must not take the plugin (and its management pages) down.
 func (config *pluginConfig) UnmarshalYAML(node *yaml.Node) error {
 	type wirePluginConfig pluginConfig
 	var decoded wirePluginConfig
 	if err := node.Decode(&decoded); err != nil {
 		return err
 	}
-	baseURL, err := normalizeCredentialBaseURL(decoded.BaseURL)
-	if err != nil {
-		return err
+	if decoded.BaseURL != "" {
+		baseURL, err := normalizeCredentialBaseURL(decoded.BaseURL)
+		if err != nil {
+			baseURL = defaultBaseURL
+		}
+		decoded.BaseURL = baseURL
 	}
-	decoded.BaseURL = baseURL
 	*config = pluginConfig(decoded)
 	return nil
 }

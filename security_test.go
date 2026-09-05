@@ -100,12 +100,20 @@ func TestCredentialRequestsAcceptCanonicalChatGPTOrigin(t *testing.T) {
 	}
 }
 
-func TestPluginConfigRejectsNonChatGPTBaseURL(t *testing.T) {
+func TestPluginConfigDowngradesNonChatGPTBaseURL(t *testing.T) {
 	t.Parallel()
 
+	// Compatibility guard: an operator's stale base_url must not fail the plugin load —
+	// it downgrades to the canonical origin instead (request-level checks stay strict).
 	var config pluginConfig
-	if err := yaml.Unmarshal([]byte("base_url: https://evil.example\nlanguage: en\n"), &config); err == nil {
-		t.Fatal("plugin config with a non-ChatGPT base_url unexpectedly succeeded")
+	if err := yaml.Unmarshal([]byte("base_url: https://evil.example\nlanguage: en\n"), &config); err != nil {
+		t.Fatalf("plugin config with a non-ChatGPT base_url failed to load: %v", err)
+	}
+	if config.BaseURL != defaultBaseURL {
+		t.Fatalf("config base_url = %q, want downgraded default %q", config.BaseURL, defaultBaseURL)
+	}
+	if config.Language != "en" {
+		t.Fatalf("config language = %q, want en", config.Language)
 	}
 }
 

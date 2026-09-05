@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -273,6 +274,7 @@ func TestRegistrationUsesCustomPageInsteadOfConfigFields(t *testing.T) {
 		http.MethodGet + " /codex-invite/accounts",
 		http.MethodPost + " /codex-invite/invite",
 		http.MethodPost + " /codex-invite/auto-assign",
+		http.MethodPost + " /codex-invite/dispatch",
 		http.MethodPost + " /codex-invite/usage",
 		http.MethodPost + " /codex-invite/referrals",
 		http.MethodPost + " /codex-invite/probe",
@@ -428,5 +430,41 @@ func TestCollectRawEmailsDedupesAndValidates(t *testing.T) {
 	}
 	if _, err := collectRawEmails(nil, "bad@@x.com", 10); err == nil {
 		t.Fatalf("invalid email should fail")
+	}
+}
+
+func TestCollectCDKsNormalizesAndDedupes(t *testing.T) {
+	cdks := collectCDKs([]string{"ca-ku9k-ghyh-g1lx-uycu", "CA-TJ5Y-EG5G-MPH0-YVJT"}, "CA-KU9K-GHYH-G1LX-UYCU\n  ca-1656-bgbf-jvkf-0hi9,,")
+	want := []string{"CA-KU9K-GHYH-G1LX-UYCU", "CA-TJ5Y-EG5G-MPH0-YVJT", "CA-1656-BGBF-JVKF-0HI9"}
+	if len(cdks) != len(want) {
+		t.Fatalf("cdks = %#v, want %#v", cdks, want)
+	}
+	for i := range want {
+		if cdks[i] != want[i] {
+			t.Fatalf("cdks[%d] = %q, want %q", i, cdks[i], want[i])
+		}
+	}
+}
+
+func TestInviteCountFromTrackingMonthlyWindow(t *testing.T) {
+	old := time.Now().AddDate(0, 0, -45).Format(time.RFC3339)
+	recent := time.Now().AddDate(0, 0, -3).Format(time.RFC3339)
+	body := fmt.Sprintf(`{"items":[{"email":"old@x.com","created_at":%q},{"email":"new@x.com","created_at":%q},{"email":"nodate@x.com"},{"referral_id":"r"}]}`, old, recent)
+	count, ok := inviteCountFromTracking([]byte(body))
+	if !ok || count != 2 {
+		t.Fatalf("count = %d ok=%v, want 2 true (recent + no-date; 45-day-old excluded)", count, ok)
+	}
+}
+
+func TestDispatchCDKSiteURLOnlyFromConfig(t *testing.T) {
+	// The dispatch flow may only talk to the configured site; a non-https override is
+	// normalized back to the default so CDKs never leak to a cleartext origin.
+	cfg := normalizeConfig(pluginConfig{CDKSiteURL: "http://evil.example"})
+	if cfg.CDKSiteURL != defaultCDKSiteURL {
+		t.Fatalf("cdk site = %q, want default %q", cfg.CDKSiteURL, defaultCDKSiteURL)
+	}
+	cfg = normalizeConfig(pluginConfig{CDKSiteURL: "https://cards.example.com/"})
+	if cfg.CDKSiteURL != "https://cards.example.com" {
+		t.Fatalf("cdk site = %q, want trimmed https origin", cfg.CDKSiteURL)
 	}
 }

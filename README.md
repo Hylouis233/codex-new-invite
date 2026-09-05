@@ -40,6 +40,14 @@ Fork of [LTbinglingfeng/cpa-plugin-codex-invite](https://github.com/LTbinglingfe
 - **Redeem** a banked rate-limit reset credit — `POST /v0/management/codex-invite/redeem`, which lists banked credits (`GET /backend-api/wham/rate-limit-reset-credits`) and redeems the first available one via `POST /backend-api/wham/rate-limit-reset-credits/consume` (`credit_id` + a generated `redeem_request_id`).
 - This is the step that actually applies an earned referral reward — without redeeming, the credit stays banked and does not restore your rate-limit window.
 
+## CDK dispatch (v0.4.0)
+
+`POST /v0/management/codex-invite/dispatch` — end-to-end CDK redemption against the card site (`cdk_site_url`, default `https://abc.dpzxsm.qzz.io`; config-only, never request-overridable since CDKs are credentials): per CDK it runs **lookup → invite from the selected account → trigger auto-accept → poll status** until redemption. Non-ready CDKs are skipped (idempotent), a failed invite never consumes the CDK, and `dry_run` previews which CDKs are ready. The invite page gains a **CDK 派发** panel.
+
+Compatibility fixes in the same release:
+- An invalid `base_url` in plugin YAML now **downgrades to the default instead of failing the whole plugin load** (request-level checks stay strict).
+- The auto-assign tracking estimate now only counts invites from the **last 31 days**, matching the monthly quota window (stale 90-day records no longer understate capacity).
+
 ## Security hardening (v0.3.1)
 
 Ported from the `agent/review-fix-20260827` review branch onto the current feature set:
