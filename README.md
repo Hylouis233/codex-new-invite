@@ -24,6 +24,17 @@ Fork of [LTbinglingfeng/cpa-plugin-codex-invite](https://github.com/LTbinglingfe
 - **Invite tracking** — how many invites sent in the past 90 days, from `GET /backend-api/referrals/invite/tracking`.
 - Bilingual UI with locale auto-detection (English / 中文), persisted to localStorage.
 
+### Auto-assign invites by quota (v0.3.0)
+
+`POST /v0/management/codex-invite/auto-assign` — input a list of invitee emails and the plugin distributes them across **every active Codex account that can still invite**, filling accounts from the **highest remaining invite quota down to the lowest**:
+
+- Per-account remaining quota is resolved in priority order: `invite/eligibility` (`remaining_send_capacity`, exact) → `invite/tracking` (90-day sent count subtracted from an assumed capacity) → the assumed capacity itself (default 10, override with `fallback_capacity`).
+- Ties are broken by credit balance; `per_account_limit` optionally caps how many emails one account receives.
+- `dry_run: true` previews the plan (quota snapshot + assignment) without sending anything.
+- Failed sends (expired token, quota exhausted mid-run) automatically roll the emails over to the next account with spare capacity; the response reports per-account `sent/failed` plus any `unassigned_emails`.
+- `accounts_filter` restricts the pool (auth index / file name / email substring match).
+- The invite page has **预览分配 / 自动分配并发送** buttons wired to this endpoint.
+
 ### Redeem reward (Codex Usage page)
 
 - **Redeem** a banked rate-limit reset credit — `POST /v0/management/codex-invite/redeem`, which lists banked credits (`GET /backend-api/wham/rate-limit-reset-credits`) and redeems the first available one via `POST /backend-api/wham/rate-limit-reset-credits/consume` (`credit_id` + a generated `redeem_request_id`).

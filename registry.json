@@ -4,9 +4,9 @@
     {
       "id": "codex-invite",
       "name": "Codex Invite (with Usage Query)",
-      "description": "Sends Codex referral invite emails AND queries Codex account usage (credit balance, rate-limit usage, referral reset credits) plus best-effort remaining-invite capacity, using a selected Codex OAuth credential. Fork of LTbinglingfeng/cpa-plugin-codex-invite with added query endpoints.",
+      "description": "Sends Codex referral invite emails AND queries Codex account usage (credit balance, rate-limit usage, referral reset credits) plus best-effort remaining-invite capacity, using a selected Codex OAuth credential. Fork of LTbinglingfeng/cpa-plugin-codex-invite with added query endpoints, plus quota-ordered auto-assignment of invitee emails across all active accounts (high quota first).",
       "author": "Hylouis233",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "repository": "https://github.com/Hylouis233/codex-new-invite",
       "logo": "",
       "homepage": "https://github.com/Hylouis233/codex-new-invite",

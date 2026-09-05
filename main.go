@@ -76,6 +76,7 @@ const (
 	maxManagementBodyBytes        = 1 << 20
 	managementAccountsPath        = "/v0/management/codex-invite/accounts"
 	managementInvitePath          = "/v0/management/codex-invite/invite"
+	managementAutoAssignPath      = "/v0/management/codex-invite/auto-assign"
 	managementUsagePath           = "/v0/management/codex-invite/usage"
 	managementReferralsPath       = "/v0/management/codex-invite/referrals"
 	managementProbePath           = "/v0/management/codex-invite/probe"
@@ -116,9 +117,16 @@ const (
 	contentTypeJSON               = "application/json; charset=utf-8"
 	contentTypeHTML               = "text/html; charset=utf-8"
 	upstreamBodyLimit       int64 = 1 << 20
+	// defaultAssumedInviteCapacity is the per-account invite capacity assumed when neither
+	// the eligibility endpoint (needs a browser Cookie) nor tracking history can determine
+	// the real remaining capacity.
+	defaultAssumedInviteCapacity = 10
+	// autoAssignProbeTimeout bounds each per-account upstream probe; the overall budget is
+	// larger so many accounts can still be scanned sequentially.
+	autoAssignProbeTimeout = 20 * time.Second
 )
 
-var pluginVersion = "0.2.0"
+var pluginVersion = "0.3.0"
 
 var (
 	activeConfig atomic.Value
@@ -297,6 +305,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		Routes: []pluginapi.ManagementRoute{
 			{Method: http.MethodGet, Path: "/codex-invite/accounts"},
 			{Method: http.MethodPost, Path: "/codex-invite/invite"},
+				{Method: http.MethodPost, Path: "/codex-invite/auto-assign"},
 				{Method: http.MethodPost, Path: "/codex-invite/usage"},
 				{Method: http.MethodPost, Path: "/codex-invite/referrals"},
 				{Method: http.MethodPost, Path: "/codex-invite/probe"},
@@ -453,6 +462,8 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return okEnvelope(handleAccounts(req.ManagementRequest))
 	case strings.EqualFold(req.Method, http.MethodPost) && path == managementInvitePath:
 		return okEnvelope(handleInvite(req.ManagementRequest))
+	case strings.EqualFold(req.Method, http.MethodPost) && path == managementAutoAssignPath:
+		return okEnvelope(handleAutoAssign(req.ManagementRequest))
 	case (strings.EqualFold(req.Method, http.MethodGet) || strings.EqualFold(req.Method, http.MethodPost)) && path == managementUsagePath:
 		return okEnvelope(handleUsage(req.ManagementRequest))
 	case (strings.EqualFold(req.Method, http.MethodGet) || strings.EqualFold(req.Method, http.MethodPost)) && path == managementReferralsPath:
@@ -545,6 +556,448 @@ func handleInvite(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 		return jsonResponse(statusForError(errSend), map[string]any{"error": errSend.Error()})
 	}
 	return jsonResponse(http.StatusOK, result)
+}
+
+// autoAssignRequest is the input for the quota-ordered auto-assignment invite endpoint:
+// the caller supplies invitee emails and the plugin distributes them across every active
+// Codex account that can still invite, filling accounts from the highest remaining invite
+// quota down to the lowest.
+type autoAssignRequest struct {
+	Emails           []string `json:"emails,omitempty"`
+	EmailsText       string   `json:"emails_text,omitempty"`
+	AccountsFilter   []string `json:"accounts_filter,omitempty"`
+	PerAccountLimit  int      `json:"per_account_limit,omitempty"`
+	FallbackCapacity int      `json:"fallback_capacity,omitempty"`
+	DryRun           bool     `json:"dry_run,omitempty"`
+	ReferralKey      string   `json:"referral_key,omitempty"`
+	BaseURL          string   `json:"base_url,omitempty"`
+	ProxyURL         string   `json:"proxy_url,omitempty"`
+	Language         string   `json:"language,omitempty"`
+	Originator       string   `json:"originator,omitempty"`
+	UserAgent        string   `json:"user_agent,omitempty"`
+	Cookie           string   `json:"cookie,omitempty"`
+	ManagementOrigin string   `json:"management_origin,omitempty"`
+}
+
+// autoAssignAccount captures one account's capacity snapshot plus its assignment outcome.
+type autoAssignAccount struct {
+	Account           accountInfo      `json:"account"`
+	Capacity          int              `json:"capacity"`
+	CapacitySource    string           `json:"capacity_source,omitempty"` // eligibility | tracking | fallback
+	CreditBalance     *float64         `json:"credit_balance,omitempty"`
+	EligibilityStatus int              `json:"eligibility_status_code,omitempty"`
+	TrackingStatus    int              `json:"tracking_status_code,omitempty"`
+	UsageStatus       int              `json:"usage_status_code,omitempty"`
+	AssignedEmails    []string         `json:"assigned_emails,omitempty"`
+	SentEmails        []string         `json:"sent_emails,omitempty"`
+	FailedEmails      []string         `json:"failed_emails,omitempty"`
+	Status            string           `json:"status,omitempty"` // planned | sent | partial | failed | skipped
+	Error             string           `json:"error,omitempty"`
+	Invites           []inviteLink     `json:"invites,omitempty"`
+	Results           []inviteResponse `json:"results,omitempty"`
+}
+
+type autoAssignResponse struct {
+	OK               bool                `json:"ok"`
+	DryRun           bool                `json:"dry_run"`
+	RequestedEmails  []string            `json:"requested_emails"`
+	Accounts         []autoAssignAccount `json:"accounts"`
+	UnassignedEmails []string            `json:"unassigned_emails,omitempty"`
+	Summary          autoAssignSummary   `json:"summary"`
+	Note             string              `json:"note,omitempty"`
+}
+
+type autoAssignSummary struct {
+	AccountsTotal    int `json:"accounts_total"`
+	AccountsEligible int `json:"accounts_eligible"`
+	EmailsRequested  int `json:"emails_requested"`
+	EmailsAssigned   int `json:"emails_assigned"`
+	EmailsSent       int `json:"emails_sent"`
+	EmailsFailed     int `json:"emails_failed"`
+	EmailsUnassigned int `json:"emails_unassigned"`
+}
+
+// handleAutoAssign distributes the requested emails across every active Codex account,
+// ordered by remaining invite quota (high → low). For each account it probes:
+//  1. GET /backend-api/referrals/invite/eligibility — authoritative remaining_send_capacity
+//     (requires a browser Cookie alongside the Bearer token, else 403);
+//  2. GET /backend-api/referrals/invite/tracking — invites already sent in the past 90 days,
+//     subtracted from the assumed capacity (fallback_capacity, default 10);
+//  3. plain fallback_capacity when neither endpoint cooperates.
+//
+// Sending failures (expired token, exhausted quota mid-run) automatically re-queue that
+// account's emails onto the next account with spare capacity.
+func handleAutoAssign(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	if len(req.Body) > maxManagementBodyBytes {
+		return jsonResponse(http.StatusRequestEntityTooLarge, map[string]any{"error": "request body is too large"})
+	}
+	var payload autoAssignRequest
+	if errUnmarshal := json.Unmarshal(req.Body, &payload); errUnmarshal != nil {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "invalid JSON request body"})
+	}
+
+	emails, errEmails := collectRawEmails(payload.Emails, payload.EmailsText, upperMaxEmails)
+	if errEmails != nil {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": errEmails.Error()})
+	}
+
+	cfg := currentConfig()
+	requestCfg := normalizeConfig(mergeConfig(cfg, pluginConfig{
+		BaseURL:    payload.BaseURL,
+		Language:   payload.Language,
+		Originator: payload.Originator,
+		UserAgent:  payload.UserAgent,
+	}))
+	referralKey := strings.TrimSpace(payload.ReferralKey)
+	if referralKey == "" {
+		referralKey = requestCfg.ReferralKey
+	}
+	cookie := strings.TrimSpace(payload.Cookie)
+	proxyURL := strings.TrimSpace(payload.ProxyURL)
+	fallbackCapacity := payload.FallbackCapacity
+	if fallbackCapacity <= 0 {
+		fallbackCapacity = defaultAssumedInviteCapacity
+	}
+	if fallbackCapacity > upperMaxEmails {
+		fallbackCapacity = upperMaxEmails
+	}
+
+	accounts, errAccounts := fetchCodexAccounts(req, payload.ManagementOrigin)
+	if errAccounts != nil {
+		return jsonResponse(statusForError(errAccounts), map[string]any{"error": errAccounts.Error()})
+	}
+	if len(payload.AccountsFilter) > 0 {
+		accounts = filterAccounts(accounts, payload.AccountsFilter)
+	}
+	if len(accounts) == 0 {
+		return jsonResponse(http.StatusNotFound, map[string]any{"error": "no matching active Codex account found"})
+	}
+
+	// Overall budget: one credential download + up to three upstream probes per account, plus
+	// the invite sends. 30 accounts ≈ a few minutes worst case.
+	budget := 4*time.Minute + time.Duration(len(accounts))*15*time.Second
+	if payload.DryRun {
+		budget = 2 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	credentials := make(map[string]codexCredential, len(accounts))
+	entries := make([]autoAssignAccount, 0, len(accounts))
+	for _, account := range accounts {
+		entry := autoAssignAccount{Account: account, Capacity: -1, Status: "planned"}
+		credential, errCredential := fetchCodexCredential(req, payload.ManagementOrigin, account)
+		if errCredential != nil {
+			entry.Status = "skipped"
+			entry.Error = "credential: " + errCredential.Error()
+			entries = append(entries, entry)
+			continue
+		}
+		if credential.AccountID == "" {
+			credential.AccountID = account.ChatGPTAccountID
+		}
+		if credential.Email == "" {
+			credential.Email = account.Email
+		}
+		credentials[account.Name] = credential
+
+		capacity, source, eligibilityStatus, trackingStatus := probeInviteCapacity(ctx, requestCfg, credential, cookie, proxyURL, fallbackCapacity)
+		entry.Capacity = capacity
+		entry.CapacitySource = source
+		entry.EligibilityStatus = eligibilityStatus
+		entry.TrackingStatus = trackingStatus
+		if capacity <= 0 {
+			entry.Status = "skipped"
+			entry.Error = "no remaining invite capacity"
+		}
+
+		// Credit balance is a display + tiebreak signal only; a failed probe never blocks the account.
+		usageCtx, usageCancel := context.WithTimeout(ctx, autoAssignProbeTimeout)
+		usage, errUsage := fetchCodexUsage(usageCtx, requestCfg, credential, account, cookie, proxyURL)
+		usageCancel()
+		if errUsage == nil {
+			entry.UsageStatus = usage.StatusCode
+			if usage.Credits != nil {
+				balance := usage.Credits.Balance
+				entry.CreditBalance = &balance
+			}
+		}
+		entries = append(entries, entry)
+	}
+
+	// Highest quota first; credit balance breaks ties so fresher accounts are preferred.
+	sortAutoAssignAccounts(entries)
+
+	response := autoAssignResponse{
+		OK:              true,
+		DryRun:          payload.DryRun,
+		RequestedEmails: emails,
+		Accounts:        entries,
+	}
+	response.Summary.AccountsTotal = len(entries)
+	for i := range entries {
+		if entries[i].Status != "skipped" && entries[i].Capacity > 0 {
+			response.Summary.AccountsEligible++
+		}
+	}
+	response.Summary.EmailsRequested = len(emails)
+
+	if payload.DryRun {
+		response.UnassignedEmails = planAutoAssignment(entries, emails, payload.PerAccountLimit)
+		for _, entry := range entries {
+			response.Summary.EmailsAssigned += len(entry.AssignedEmails)
+		}
+		response.Summary.EmailsUnassigned = len(response.UnassignedEmails)
+		response.Note = "DRY RUN：仅按额度排序并预演分配，未发送任何邀请。配额来源 eligibility=精确剩余邀请次数（需要 Cookie）；tracking=按 90 天已发送数从假定配额中扣减；fallback=直接采用假定配额。"
+		return jsonResponse(http.StatusOK, response)
+	}
+
+	// Execute: walk the sorted accounts, sending each account's greedy share. Emails whose
+	// send fails fall back to the next account with spare capacity.
+	pending := append([]string(nil), emails...)
+	for i := range entries {
+		if len(pending) == 0 {
+			break
+		}
+		entry := &entries[i]
+		if entry.Status == "skipped" || entry.Capacity <= 0 {
+			continue
+		}
+		limit := entry.Capacity
+		if payload.PerAccountLimit > 0 && payload.PerAccountLimit < limit {
+			limit = payload.PerAccountLimit
+		}
+		take := len(pending)
+		if take > limit {
+			take = limit
+		}
+		batch := append([]string(nil), pending[:take]...)
+
+		credential := credentials[entry.Account.Name]
+		var sendErr string
+		for _, chunk := range chunkEmails(batch, requestCfg.MaxEmailsPerRequest) {
+			result, errSend := sendInvite(ctx, requestCfg, credential, entry.Account, chunk, referralKey, cookie, proxyURL)
+			if errSend != nil {
+				sendErr = errSend.Error()
+				entry.FailedEmails = append(entry.FailedEmails, chunk...)
+				continue
+			}
+			entry.Results = append(entry.Results, result)
+			if result.OK {
+				entry.SentEmails = append(entry.SentEmails, chunk...)
+				entry.Invites = append(entry.Invites, result.Invites...)
+			} else {
+				if sendErr == "" {
+					sendErr = fmt.Sprintf("upstream status %d", result.StatusCode)
+				}
+				entry.FailedEmails = append(entry.FailedEmails, chunk...)
+			}
+		}
+		entry.AssignedEmails = batch
+		switch {
+		case len(entry.FailedEmails) == 0:
+			entry.Status = "sent"
+		case len(entry.SentEmails) > 0:
+			entry.Status = "partial"
+			entry.Error = sendErr
+		default:
+			entry.Status = "failed"
+			entry.Error = sendErr
+		}
+
+		// Keep only emails that were not successfully sent; failed ones stay in the queue
+		// so a later account can retry them.
+		stillPending := make([]string, 0, len(pending))
+		sent := make(map[string]struct{}, len(entry.SentEmails))
+		for _, email := range entry.SentEmails {
+			sent[strings.ToLower(email)] = struct{}{}
+		}
+		for _, email := range pending {
+			if _, ok := sent[strings.ToLower(email)]; !ok {
+				stillPending = append(stillPending, email)
+			}
+		}
+		pending = stillPending
+	}
+
+	for _, entry := range entries {
+		response.Summary.EmailsAssigned += len(entry.AssignedEmails)
+		response.Summary.EmailsSent += len(entry.SentEmails)
+		response.Summary.EmailsFailed += len(entry.FailedEmails)
+	}
+	response.UnassignedEmails = pending
+	response.Summary.EmailsUnassigned = len(pending)
+	if len(pending) > 0 {
+		response.Note = fmt.Sprintf("有 %d 个邮箱未能分配或发送失败（所有可邀账号的剩余额度已用尽或发送失败）。", len(pending))
+	}
+	return jsonResponse(http.StatusOK, response)
+}
+
+// probeInviteCapacity resolves an account's remaining invite quota. Preference order:
+// eligibility (exact, needs Cookie) → tracking history subtracted from the assumed capacity
+// → the assumed capacity itself. Returns (capacity, source, eligibility status, tracking
+// status); capacity <= 0 means the account cannot invite right now.
+func probeInviteCapacity(ctx context.Context, cfg pluginConfig, credential codexCredential, requestCookie, proxyURL string, fallbackCapacity int) (int, string, int, int) {
+	eligibilityStatus := 0
+	trackingStatus := 0
+
+	eligBase, errEligURL := codexEndpoint(cfg.BaseURL, inviteEligibilityEndpointPath)
+	if errEligURL == nil {
+		eligURL := eligBase + "?program_id=" + programIDConsumer + "&entrypoint=" + entrypointPersistent
+		previewHeaders := http.Header{"OpenAI-Internal-Referral-Eligibility-Preview": []string{"true"}}
+		probeCtx, cancel := context.WithTimeout(ctx, autoAssignProbeTimeout)
+		status, _, raw, errGet := codexGetURLWithHeaders(probeCtx, cfg, credential, eligURL, requestCookie, proxyURL, previewHeaders)
+		cancel()
+		eligibilityStatus = status
+		if errGet == nil && status >= 200 && status < 300 && len(raw) > 0 {
+			if capacity, ok := capacityFromEligibility(raw); ok {
+				return capacity, "eligibility", eligibilityStatus, trackingStatus
+			}
+		}
+	}
+
+	trackBase, errTrackURL := codexEndpoint(cfg.BaseURL, inviteTrackingEndpointPath)
+	if errTrackURL == nil {
+		trackURL := trackBase + "?limit=100&period=past_90_days&program_id=" + programIDConsumer
+		probeCtx, cancel := context.WithTimeout(ctx, autoAssignProbeTimeout)
+		status, _, raw, errGet := codexGet(probeCtx, cfg, credential, trackURL, requestCookie, proxyURL)
+		cancel()
+		trackingStatus = status
+		if errGet == nil && status >= 200 && status < 300 && len(raw) > 0 {
+			if sent, ok := inviteCountFromTracking(raw); ok {
+				remaining := fallbackCapacity - sent
+				if remaining < 0 {
+					remaining = 0
+				}
+				return remaining, "tracking", eligibilityStatus, trackingStatus
+			}
+		}
+	}
+
+	return fallbackCapacity, "fallback", eligibilityStatus, trackingStatus
+}
+
+// capacityFromEligibility extracts remaining_send_capacity from an invite/eligibility body.
+func capacityFromEligibility(raw []byte) (int, bool) {
+	var data map[string]any
+	if errJSON := json.Unmarshal(raw, &data); errJSON != nil {
+		return 0, false
+	}
+	value, ok := lookupNested(data, "remaining_send_capacity")
+	if !ok {
+		return 0, false
+	}
+	return toInt(value), true
+}
+
+// inviteCountFromTracking counts sent-invite records (items with an email) from an
+// invite/tracking body.
+func inviteCountFromTracking(raw []byte) (int, bool) {
+	var data struct {
+		Items []map[string]any `json:"items"`
+	}
+	if errJSON := json.Unmarshal(raw, &data); errJSON != nil {
+		return 0, false
+	}
+	count := 0
+	for _, item := range data.Items {
+		if _, ok := item["email"]; ok {
+			count++
+		}
+	}
+	return count, true
+}
+
+// filterAccounts keeps accounts matching any filter token. Tokens match the auth index or
+// file name exactly, or the account email/name by substring (case-insensitive).
+func filterAccounts(accounts []accountInfo, filters []string) []accountInfo {
+	normalized := make([]string, 0, len(filters))
+	for _, filter := range filters {
+		filter = strings.ToLower(strings.TrimSpace(filter))
+		if filter != "" {
+			normalized = append(normalized, filter)
+		}
+	}
+	if len(normalized) == 0 {
+		return accounts
+	}
+	out := make([]accountInfo, 0, len(accounts))
+	for _, account := range accounts {
+		email := strings.ToLower(account.Email)
+		name := strings.ToLower(account.Name)
+		for _, filter := range normalized {
+			if strings.EqualFold(account.AuthIndex, filter) || strings.EqualFold(account.Name, filter) ||
+				strings.Contains(email, filter) || strings.Contains(name, filter) {
+				out = append(out, account)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// sortAutoAssignAccounts orders accounts by remaining invite capacity (high → low), breaking
+// ties with the credit balance so the freshest accounts are filled first.
+func sortAutoAssignAccounts(entries []autoAssignAccount) {
+	creditOf := func(entry autoAssignAccount) float64 {
+		if entry.CreditBalance == nil {
+			return -1
+		}
+		return *entry.CreditBalance
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].Capacity != entries[j].Capacity {
+			return entries[i].Capacity > entries[j].Capacity
+		}
+		if creditOf(entries[i]) != creditOf(entries[j]) {
+			return creditOf(entries[i]) > creditOf(entries[j])
+		}
+		left := strings.ToLower(entries[i].Account.Email + entries[i].Account.Name)
+		right := strings.ToLower(entries[j].Account.Email + entries[j].Account.Name)
+		return left < right
+	})
+}
+
+// planAutoAssignment is the pure greedy planner used by dry runs (and unit tests): it fills
+// each entry (already sorted high → low quota) up to its capacity and the optional
+// per-account limit, mutating AssignedEmails, and returns the emails that did not fit.
+func planAutoAssignment(entries []autoAssignAccount, emails []string, perAccountLimit int) []string {
+	pending := append([]string(nil), emails...)
+	for i := range entries {
+		if len(pending) == 0 {
+			break
+		}
+		if entries[i].Status == "skipped" || entries[i].Capacity <= 0 {
+			continue
+		}
+		limit := entries[i].Capacity
+		if perAccountLimit > 0 && perAccountLimit < limit {
+			limit = perAccountLimit
+		}
+		take := len(pending)
+		if take > limit {
+			take = limit
+		}
+		entries[i].AssignedEmails = append([]string(nil), pending[:take]...)
+		pending = pending[take:]
+	}
+	return pending
+}
+
+// chunkEmails splits an email batch into POST-sized chunks for the invite endpoint.
+func chunkEmails(emails []string, size int) [][]string {
+	if size <= 0 {
+		size = defaultMaxEmails
+	}
+	chunks := make([][]string, 0, (len(emails)+size-1)/size)
+	for start := 0; start < len(emails); start += size {
+		end := start + size
+		if end > len(emails) {
+			end = len(emails)
+		}
+		chunks = append(chunks, emails[start:end])
+	}
+	return chunks
 }
 
 // queryRequest is the shared input shape for the usage and referrals query endpoints.
@@ -1012,6 +1465,12 @@ func statusForError(err error) int {
 }
 
 func collectEmails(req inviteRequest, maxEmails int) ([]string, error) {
+	return collectRawEmails(req.Emails, req.EmailsText, maxEmails)
+}
+
+// collectRawEmails merges an email array and a free-form email text field, deduplicates
+// (case-insensitive), validates every address, and enforces the max count.
+func collectRawEmails(emails []string, emailsText string, maxEmails int) ([]string, error) {
 	if maxEmails <= 0 {
 		maxEmails = defaultMaxEmails
 	}
@@ -1035,10 +1494,10 @@ func collectEmails(req inviteRequest, maxEmails int) ([]string, error) {
 			out = append(out, email)
 		}
 	}
-	for _, item := range req.Emails {
+	for _, item := range emails {
 		add(item)
 	}
-	add(req.EmailsText)
+	add(emailsText)
 
 	if len(out) == 0 {
 		return nil, fmt.Errorf("at least one email is required")
@@ -2737,6 +3196,28 @@ func renderInvitePage(cfg pluginConfig) string {
           </div>
         </div>
       </section>
+      <section class="panel">
+        <h2 data-i18n="auto.title">Auto-assign (quota high → low)</h2>
+        <div class="fields">
+          <div class="grid">
+            <label><span data-i18n="auto.perAccountLimit">Per-account limit (0 = fill by quota)</span>
+              <input id="perAccountLimit" type="number" min="0" max="50" step="1" value="0">
+            </label>
+            <label><span data-i18n="auto.assumedCapacity">Assumed capacity / account</span>
+              <input id="assumedCapacity" type="number" min="1" max="50" step="1" value="10">
+            </label>
+          </div>
+          <div class="actions">
+            <button id="previewAssign" type="button" class="secondary" data-i18n="auto.preview">Preview assignment</button>
+            <button id="autoAssign" type="button" data-i18n="auto.send">Auto-assign invites</button>
+          </div>
+          <span class="muted" data-i18n="auto.hint">
+            Uses the emails above. Every active account is sorted by remaining invite quota
+            (eligibility → tracking estimate → assumed capacity) and filled from the highest
+            quota down; failed sends roll over to the next account automatically.
+          </span>
+        </div>
+      </section>
     </div>
     <section id="status" class="status" hidden></section>
     <section id="links" class="links"></section>
@@ -2774,8 +3255,16 @@ func renderInvitePage(cfg pluginConfig) string {
         'invite.proxyUrl': 'Proxy URL',
         'invite.emails': 'Email addresses',
         'invite.emailsPlaceholder': 'name@example.com\nteammate@example.com',
-        'invite.send': 'Send invites',
-        'invite.clearResult': 'Clear result',
+	        'invite.send': 'Send invites',
+	        'invite.clearResult': 'Clear result',
+	        'auto.title': 'Auto-assign (quota high → low)',
+	        'auto.perAccountLimit': 'Per-account limit (0 = fill by quota)',
+	        'auto.assumedCapacity': 'Assumed capacity / account',
+	        'auto.preview': 'Preview assignment',
+	        'auto.send': 'Auto-assign invites',
+	        'auto.hint': 'Uses the emails above. Every active account is sorted by remaining invite quota (eligibility → tracking estimate → assumed capacity) and filled from the highest quota down; failed sends roll over to the next account automatically.',
+	        'auto.summary': '{sent}/{requested} invites sent · {unassigned} unassigned · {accounts} eligible accounts',
+	        'auto.previewSummary': 'DRY RUN — plan: {assigned}/{requested} assigned · {unassigned} unassigned · {accounts} eligible accounts',
         'email.countOne': '{count} email',
         'email.countOther': '{count} emails',
         'account.none': 'No Codex accounts loaded',
@@ -2818,8 +3307,16 @@ func renderInvitePage(cfg pluginConfig) string {
         'invite.proxyUrl': '代理地址',
         'invite.emails': '邮箱地址',
         'invite.emailsPlaceholder': 'name@example.com\nteammate@example.com',
-        'invite.send': '发送邀请',
-        'invite.clearResult': '清空结果',
+	        'invite.send': '发送邀请',
+	        'invite.clearResult': '清空结果',
+	        'auto.title': '自动分配（额度从高到低）',
+	        'auto.perAccountLimit': '每账号上限（0 = 按额度填满）',
+	        'auto.assumedCapacity': '每账号假定配额',
+	        'auto.preview': '预览分配（不发送）',
+	        'auto.send': '自动分配并发送',
+	        'auto.hint': '使用上方填写的邮箱。自动查询所有活跃账号的剩余邀请额度（优先 eligibility 精确值，其次按已发送数估算，最后用假定配额），从额度最高的账号开始分配；发送失败会自动顺延到下一个账号。',
+	        'auto.summary': '已发送 {sent}/{requested} · 未分配 {unassigned} · 可邀账号 {accounts} 个',
+	        'auto.previewSummary': '预演：分配 {assigned}/{requested} · 未分配 {unassigned} · 可邀账号 {accounts} 个',
         'email.countOne': '{count} 个邮箱',
         'email.countOther': '{count} 个邮箱',
         'account.none': '未加载 Codex 账号',
@@ -2871,6 +3368,8 @@ func renderInvitePage(cfg pluginConfig) string {
     const resetLocalButton = field('resetLocal');
     const sendButton = field('send');
     const clearResultButton = field('clearResult');
+    const previewAssignButton = field('previewAssign');
+    const autoAssignButton = field('autoAssign');
     const accountCount = field('accountCount');
     const emailCount = field('emailCount');
     const credMode = field('credMode');
@@ -3034,15 +3533,20 @@ func renderInvitePage(cfg pluginConfig) string {
       return text.split(/[,\s;]+/).map((item) => item.trim()).filter(Boolean);
     }
 
-    function updateEmailCount() {
-      const count = splitEmails(field('emails').value).length;
-      emailCount.textContent = emailCountText(count);
-      const manual = credMode && credMode.value === 'manual';
-      const hasTarget = manual
-        ? !!field('manualToken').value.trim()
-        : !!accountSelect.selectedOptions.length;
-      sendButton.disabled = count === 0 || !hasTarget;
-    }
+	    function updateEmailCount() {
+	      const count = splitEmails(field('emails').value).length;
+	      emailCount.textContent = emailCountText(count);
+	      const manual = credMode && credMode.value === 'manual';
+	      const hasTarget = manual
+	        ? !!field('manualToken').value.trim()
+	        : !!accountSelect.selectedOptions.length;
+	      sendButton.disabled = count === 0 || !hasTarget;
+	      // Auto-assign works across all accounts at once, so it only needs emails — but it
+	      // never applies in manual-credential mode.
+	      const autoOk = count > 0 && !manual;
+	      previewAssignButton.disabled = !autoOk;
+	      autoAssignButton.disabled = !autoOk;
+	    }
 
     function renderAccounts(accounts) {
       accountSelect.innerHTML = '';
@@ -3129,14 +3633,80 @@ func renderInvitePage(cfg pluginConfig) string {
       }
     }
 
+    // runAutoAssign distributes the emails textarea across all active accounts, ordered by
+    // remaining invite quota (high → low). dryRun=true only previews the plan.
+	    async function runAutoAssign(dryRun) {
+	      clearResult();
+	      const button = dryRun ? previewAssignButton : autoAssignButton;
+	      button.disabled = true;
+	      try {
+	        const settings = getSettings();
+	        const payload = {
+	          emails_text: field('emails').value,
+	          per_account_limit: Number.parseInt(field('perAccountLimit').value, 10) || 0,
+	          fallback_capacity: Number.parseInt(field('assumedCapacity').value, 10) || 0,
+	          dry_run: dryRun,
+	          referral_key: settings.referral_key,
+	          base_url: settings.base_url,
+	          proxy_url: settings.proxy_url,
+	          language: settings.language,
+	          originator: settings.originator,
+	          user_agent: settings.user_agent,
+	          max_emails_per_request: settings.max_emails_per_request,
+	          cookie: field('cookie').value,
+	          management_origin: origin
+	        };
+	        const response = await fetch('/v0/management/codex-invite/auto-assign', {
+	          method: 'POST',
+	          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+	          body: JSON.stringify(payload)
+	        });
+	        const data = await readJSON(response);
+	        if (!response.ok) throw new Error(formatError(data, t('error.inviteFailed')));
+	        const summary = data.summary || {};
+	        const head = dryRun
+	          ? t('auto.previewSummary', {
+	              assigned: summary.emails_assigned || 0,
+	              requested: summary.emails_requested || 0,
+	              unassigned: summary.emails_unassigned || 0,
+	              accounts: summary.accounts_eligible || 0
+	            })
+	          : t('auto.summary', {
+	              sent: summary.emails_sent || 0,
+	              requested: summary.emails_requested || 0,
+	              unassigned: summary.emails_unassigned || 0,
+	              accounts: summary.accounts_eligible || 0
+	            });
+	        setStatus(head + '\n\n' + JSON.stringify(data, null, 2), !data.ok || (summary.emails_unassigned || 0) > 0);
+	        for (const account of data.accounts || []) {
+	          for (const invite of account.invites || []) {
+	            if (!invite.invite_url) continue;
+	            const link = document.createElement('a');
+	            link.href = invite.invite_url;
+	            link.target = '_blank';
+	            link.rel = 'noreferrer';
+	            const owner = (account.account && (account.account.email || account.account.name)) || '';
+	            link.textContent = (invite.email || 'invite') + (owner ? ' @ ' + owner : '') + ': ' + invite.invite_url;
+	            linksBox.appendChild(link);
+	          }
+	        }
+	      } catch (error) {
+	        setStatus(error.message || String(error), true);
+	      } finally {
+	        updateEmailCount();
+	      }
+	    }
+
     localeSelect.addEventListener('change', () => changeLocale(localeSelect.value));
-    loadButton.addEventListener('click', loadAccounts);
-    saveLocalButton.addEventListener('click', saveLocalSettings);
-    resetLocalButton.addEventListener('click', resetLocalSettings);
-    sendButton.addEventListener('click', sendInvites);
-    clearResultButton.addEventListener('click', clearResult);
-    field('emails').addEventListener('input', updateEmailCount);
-    accountSelect.addEventListener('change', updateEmailCount);
+	    loadButton.addEventListener('click', loadAccounts);
+	    saveLocalButton.addEventListener('click', saveLocalSettings);
+	    resetLocalButton.addEventListener('click', resetLocalSettings);
+	    sendButton.addEventListener('click', sendInvites);
+	    clearResultButton.addEventListener('click', clearResult);
+	    previewAssignButton.addEventListener('click', () => runAutoAssign(true));
+	    autoAssignButton.addEventListener('click', () => runAutoAssign(false));
+	    field('emails').addEventListener('input', updateEmailCount);
+	    accountSelect.addEventListener('change', updateEmailCount);
     renderAccounts([]);
     applyLocale();
     loadLocalSettings();
