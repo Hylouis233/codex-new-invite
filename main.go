@@ -51,8 +51,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"os"
-	"os/exec"
 	"time"
 	"unsafe"
 
@@ -125,10 +123,8 @@ const (
 	// autoAssignProbeTimeout bounds each per-account upstream probe; the overall budget is
 	// larger so many accounts can still be scanned sequentially.
 	autoAssignProbeTimeout = 20 * time.Second
-	// defaultCDKSiteURL is the CDK redemption site whose lookup/use/status API drives the
-	// dispatch flow. CDKs are credentials, so the site URL is fixed in plugin config and
-	// can never be overridden per request.
-	defaultCDKSiteURL = "https://abc.dpzxsm.qzz.io"
+	// No third-party CDK destination is selected until the operator configures one.
+	defaultCDKSiteURL = ""
 	// dispatchPollInterval / dispatchPollTimeout bound the per-CDK redemption wait.
 	dispatchPollInterval = 10 * time.Second
 	dispatchPollTimeout = 5 * time.Minute
@@ -325,9 +321,6 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 				{Method: http.MethodPost, Path: "/codex-invite/referrals"},
 				{Method: http.MethodPost, Path: "/codex-invite/probe"},
 				{Method: http.MethodPost, Path: "/codex-invite/redeem"},
-				{Method: http.MethodPost, Path: "/codex-invite/activate"},
-				{Method: http.MethodPost, Path: "/codex-invite/cdp-activate"},
-				{Method: http.MethodPost, Path: "/codex-invite/desktop-activate"},
 		},
 			Resources: []pluginapi.ResourceRoute{
 				{
@@ -437,13 +430,8 @@ func normalizeConfig(cfg pluginConfig) pluginConfig {
 	if cfg.MaxEmailsPerRequest > upperMaxEmails {
 		cfg.MaxEmailsPerRequest = upperMaxEmails
 	}
-	cfg.CDKSiteURL = strings.TrimRight(strings.TrimSpace(cfg.CDKSiteURL), "/")
-	if cfg.CDKSiteURL == "" {
-		cfg.CDKSiteURL = defaultCDKSiteURL
-	}
-	if !strings.HasPrefix(strings.ToLower(cfg.CDKSiteURL), "https://") {
-		cfg.CDKSiteURL = defaultCDKSiteURL
-	}
+	// Invalid or absent configuration disables dispatch rather than selecting a vendor.
+	cfg.CDKSiteURL, _ = normalizeCDKSiteURL(cfg.CDKSiteURL)
 	return cfg
 }
 
@@ -1091,6 +1079,22 @@ type dispatchSummary struct {
 // cdkSiteCall posts a JSON body to one of the card site's /api/* endpoints and decodes
 // the response envelope {email, status, error, ...}.
 func cdkSiteCall(ctx context.Context, client *http.Client, siteURL, path string, body map[string]string) (map[string]any, int, error) {
+	validated, errSite := normalizeCDKSiteURL(siteURL)
+	if errSite != nil || validated == "" {
+		return nil, 0, fmt.Errorf("a configured HTTPS CDK origin is required")
+	}
+	switch path {
+	case "/api/lookup", "/api/use", "/api/status":
+	default:
+		return nil, 0, fmt.Errorf("unsupported CDK API path")
+	}
+	if client == nil {
+		return nil, 0, fmt.Errorf("CDK HTTP client is required")
+	}
+	// Do not mutate the caller's client or permit redirects to replay credential bodies.
+	boundedClient := *client
+	boundedClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	siteURL = validated
 	raw, errMarshal := json.Marshal(body)
 	if errMarshal != nil {
 		return nil, 0, errMarshal
@@ -1101,7 +1105,7 @@ func cdkSiteCall(ctx context.Context, client *http.Client, siteURL, path string,
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	resp, errDo := client.Do(req)
+	resp, errDo := boundedClient.Do(req)
 	if errDo != nil {
 		return nil, 0, errDo
 	}
@@ -1111,8 +1115,8 @@ func cdkSiteCall(ctx context.Context, client *http.Client, siteURL, path string,
 		return nil, resp.StatusCode, errRead
 	}
 	var decoded map[string]any
-	if len(payload) > 0 {
-		_ = json.Unmarshal(payload, &decoded)
+	if err := json.Unmarshal(payload, &decoded); err != nil || decoded == nil {
+		return nil, resp.StatusCode, fmt.Errorf("invalid CDK response object")
 	}
 	return decoded, resp.StatusCode, nil
 }
@@ -1135,6 +1139,14 @@ func handleDispatch(req pluginapi.ManagementRequest) pluginapi.ManagementRespons
 	}
 
 	cfg := currentConfig()
+	siteURL, errSite := normalizeCDKSiteURL(cfg.CDKSiteURL)
+	if errSite != nil || siteURL == "" {
+		return jsonResponse(http.StatusServiceUnavailable, map[string]any{"error": "dispatch requires an explicitly configured HTTPS cdk_site_url"})
+	}
+	cfg.CDKSiteURL = siteURL
+	if strings.TrimSpace(payload.AuthIndex) == "" && strings.TrimSpace(payload.AuthName) == "" {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "explicit managed account required"})
+	}
 	requestCfg := normalizeConfig(mergeConfig(cfg, pluginConfig{
 		BaseURL:    payload.BaseURL,
 		Language:   payload.Language,
@@ -1367,12 +1379,22 @@ type queryRequest struct {
 
 // parseQueryRequest decodes a query request body, tolerant of empty bodies so a plain
 // GET with no JSON still works (the account can be auto-selected when only one exists).
-func parseQueryRequest(body []byte) queryRequest {
-	var payload queryRequest
-	if len(body) > 0 {
-		_ = json.Unmarshal(body, &payload)
+func parseQueryRequest(body []byte) (queryRequest, error) {
+	if len(body) > maxManagementBodyBytes {
+		return queryRequest{}, httpStatusError{status: http.StatusRequestEntityTooLarge, msg: "request body is too large"}
 	}
-	return payload
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return queryRequest{}, nil
+	}
+	if trimmed[0] != '{' {
+		return queryRequest{}, httpStatusError{status: http.StatusBadRequest, msg: "JSON object required"}
+	}
+	var payload queryRequest
+	if err := json.Unmarshal(trimmed, &payload); err != nil {
+		return queryRequest{}, httpStatusError{status: http.StatusBadRequest, msg: "invalid JSON request body"}
+	}
+	return payload, nil
 }
 
 // selectQueryAccount reuses the invite account lister and selector for query endpoints,
@@ -1507,7 +1529,10 @@ type referralsResponse struct {
 }
 
 func handleUsage(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	payload := parseQueryRequest(req.Body)
+	payload, errPayload := parseQueryRequest(req.Body)
+	if errPayload != nil {
+		return jsonResponse(statusForError(errPayload), map[string]any{"error": errPayload.Error()})
+	}
 
 	credential, account, errAccount := resolveQueryCredential(req, payload)
 	if errAccount != nil {
@@ -1531,7 +1556,10 @@ func handleUsage(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 }
 
 func handleReferrals(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	payload := parseQueryRequest(req.Body)
+	payload, errPayload := parseQueryRequest(req.Body)
+	if errPayload != nil {
+		return jsonResponse(statusForError(errPayload), map[string]any{"error": errPayload.Error()})
+	}
 
 	credential, account, errAccount := resolveQueryCredential(req, payload)
 	if errAccount != nil {
@@ -1559,7 +1587,10 @@ func handleReferrals(req pluginapi.ManagementRequest) pluginapi.ManagementRespon
 // returning status + a body preview for each. It exists to reverse-engineer
 // which (if any) endpoint exposes referral invite counts / credit rewards.
 func handleProbe(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	payload := parseQueryRequest(req.Body)
+	payload, errPayload := parseQueryRequest(req.Body)
+	if errPayload != nil {
+		return jsonResponse(statusForError(errPayload), map[string]any{"error": errPayload.Error()})
+	}
 
 	var endpoints []string
 	if len(req.Body) > 0 {
@@ -1668,7 +1699,10 @@ func handleProbe(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 // via POST /backend-api/wham/rate-limit-reset-redits/consume. This is the action that turns a
 // stored referral reward into actual rate-limit window resets.
 func handleRedeem(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	payload := parseQueryRequest(req.Body)
+	payload, errPayload := parseQueryRequest(req.Body)
+	if errPayload != nil {
+		return jsonResponse(statusForError(errPayload), map[string]any{"error": errPayload.Error()})
+	}
 
 	// Redeeming consumes a banked credit, so the account must be named explicitly instead
 	// of silently falling back to the first managed credential.
@@ -1864,295 +1898,17 @@ func collectRawEmails(emails []string, emailsText string, maxEmails int) ([]stri
 	return out, nil
 }
 
-// handleActivate 调用 _full_v5.py 完成全链路激活（登录→OTP→邀请→OAuth→手机验证→token→codex消息→CPA导出）
-// 接收 email + card 参数，返回 JSON 结果。长期运行（OTP等待+手机验证可能数分钟）。
-func handleActivate(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	payload := parseQueryRequest(req.Body)
-	email := strings.TrimSpace(payload.Email)
-	card := strings.TrimSpace(payload.Card)
-
-	if email == "" {
-		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "email required"})
-	}
-	// card 可为空（DRY RUN）或非空（激活）
-
-	// 定位 _full_v5.py
-	scriptPath := ""
-	for _, candidate := range []string{
-		`G:\Github\playground\codex-auto-invite\_full_v5.py`,
-		`/opt/codex-auto-invite/_full_v5.py`,
-		`./codex-auto-invite/_full_v5.py`,
-	} {
-		if _, err := os.Stat(candidate); err == nil {
-			scriptPath = candidate
-			break
-		}
-	}
-	if scriptPath == "" {
-		return jsonResponse(http.StatusInternalServerError, map[string]any{
-			"error": "_full_v5.py not found in any known location",
-		})
-	}
-
-	// 构建命令行参数
-	args := []string{scriptPath, "--email", email, "--json"}
-	if card != "" {
-		args = append(args, "--card", card)
-	} else {
-		args = append(args, "--dry-run")
-	}
-	// mail-auth 从环境变量或固定值
-	mailAuth := os.Getenv("MAIL_AUTH")
-	if mailAuth == "" {
-		mailAuth = "lhdmm1230" // 默认值（Mox bridge）
-	}
-	args = append(args, "--mail-auth", mailAuth)
-
-	// 调用 Python 脚本（最长 10 分钟超时）
-	cmd := exec.Command("python", args...)
-	// Windows 下 python 可能需要完整路径
-	if _, err := exec.LookPath("python"); err != nil {
-		// 尝试常见路径
-		for _, py := range []string{
-			`C:\Python313\python.exe`,
-			`C:\Users\10126\AppData\Local\Programs\Python\Python311\python.exe`,
-		} {
-			if _, err := os.Stat(py); err == nil {
-				cmd = exec.Command(py, args...)
-				break
-			}
-		}
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-	cmd = exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		// 脚本出错——检查是否有 JSON 输出
-		output := stdout.String()
-		var result map[string]any
-		if err := json.Unmarshal([]byte(output), &result); err == nil {
-			result["exit_error"] = err.Error()
-			return jsonResponse(http.StatusOK, result)
-		}
-		return jsonResponse(http.StatusInternalServerError, map[string]any{
-			"error":   err.Error(),
-			"stdout":  stdout.String()[:2000],
-			"stderr":  stderr.String()[:500],
-			"timeout": ctx.Err() != nil,
-		})
-	}
-
-	// 解析 JSON 输出
-	output := stdout.String()
-	var result map[string]any
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		return jsonResponse(http.StatusInternalServerError, map[string]any{
-			"error": "failed to parse script output: " + err.Error(),
-			"stdout": output[:2000],
-		})
-	}
-	return jsonResponse(http.StatusOK, result)
+// Deprecated local activation routes return Gone without executing external programs.
+func handleActivate(_ pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	return jsonResponse(http.StatusGone, map[string]any{"error": "local activation is not supported by this plugin"})
 }
 
-// handleCDPActivate 通过 CDP 在 ChatGPT Desktop 里注入 cookie 并发消息（触发 codex_turn）
-// 调用 Python 脚本完成：CloakBrowser登录导出cookie → CDP注入 → 发消息
-func handleCDPActivate(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	payload := parseQueryRequest(req.Body)
-	email := strings.TrimSpace(payload.Email)
-	if email == "" {
-		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "email required"})
-	}
-
-	// 定位 CDP 脚本
-	scriptPath := ""
-	for _, candidate := range []string{
-		`G:\Github\playground\codex-auto-invite\_cdp_auto.py`,
-		`/opt/codex-auto-invite/_cdp_auto.py`,
-	} {
-		if _, err := os.Stat(candidate); err == nil {
-			scriptPath = candidate
-			break
-		}
-	}
-	if scriptPath == "" {
-		return jsonResponse(http.StatusInternalServerError, map[string]any{
-			"error": "_cdp_auto.py not found",
-		})
-	}
-
-	args := []string{scriptPath, "--host", "127.0.0.1", "--email", email, "--msg", "Hello"}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-
-	pyExe := "python"
-	for _, py := range []string{`C:\Python313\python.exe`, `C:\Users\10126\AppData\Local\Programs\Python\Python311\python.exe`} {
-		if _, err := os.Stat(py); err == nil {
-			pyExe = py
-			break
-		}
-	}
-
-	cmd := exec.CommandContext(ctx, pyExe, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return jsonResponse(http.StatusOK, map[string]any{
-			"success":  false,
-			"error":    err.Error(),
-			"stdout":   stdout.String()[:min(2000, stdout.Len())],
-			"timeout":  ctx.Err() != nil,
-		})
-	}
-
-	output := stdout.String()
-	var result map[string]any
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		return jsonResponse(http.StatusOK, map[string]any{
-			"success": true,
-			"stdout":  output[:min(2000, len(output))],
-		})
-	}
-	return jsonResponse(http.StatusOK, result)
+func handleCDPActivate(_ pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	return jsonResponse(http.StatusGone, map[string]any{"error": "local activation is not supported by this plugin"})
 }
 
-// handleDesktopActivate 通过 accept-referral 先行 → OTP → Codex OAuth → auth.json → Codex app 发消息。
-// 正确顺序（2026-08-12 确认）：先点击邀请链接，再登录，然后在 Codex 发消息。
-// 流程：_full_v6.py（accept-referral→OTP→OAuth→auth.json）→ _codex_send_msg.py（Codex app 发消息）
-// 前提：hylouis2 上 Codex app（ChatGPT.exe --remote-debugging-port=9222）已启动
-func handleDesktopActivate(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	payload := parseQueryRequest(req.Body)
-	email := strings.TrimSpace(payload.Email)
-	card := strings.TrimSpace(payload.Card)
-	if email == "" {
-		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "email required"})
-	}
-
-	// 定位脚本（fullScript 必须存在；sendScript 仅非 DRY RUN 时需要）
-	fullScript := "G:\\Github\\playground\\codex-auto-invite\\_full_v6.py"
-	sendScript := "G:\\Github\\playground\\codex-auto-invite\\_codex_send_msg.py"
-	if _, err := os.Stat(fullScript); err != nil {
-		return jsonResponse(http.StatusInternalServerError, map[string]any{
-			"error": "_full_v6.py not found: " + fullScript,
-		})
-	}
-
-	pyExe := "python"
-	for _, py := range []string{`C:\Python313\python.exe`, `C:\Users\10126\AppData\Local\Programs\Python\Python311\python.exe`} {
-		if _, err := os.Stat(py); err == nil {
-			pyExe = py
-			break
-		}
-	}
-
-	// Step 1: _full_v6.py（accept-referral → OTP → OAuth → auth.json）
-	isDryRun := card == ""
-	step1Args := []string{fullScript, "--email", email, "--json"}
-	if isDryRun {
-		step1Args = append(step1Args, "--dry-run")
-	} else {
-		step1Args = append(step1Args, "--card", card)
-	}
-
-	result := map[string]any{"email": email, "dry_run": isDryRun, "steps": map[string]any{}}
-
-	// Run _full_v6.py (up to 10 min for OTP wait)
-	ctx1, cancel1 := context.WithTimeout(context.Background(), 10*time.Minute)
-	cmd1 := exec.CommandContext(ctx1, pyExe, step1Args...)
-	var stdout1, stderr1 bytes.Buffer
-	cmd1.Stdout = &stdout1
-	cmd1.Stderr = &stderr1
-	err1 := cmd1.Run()
-	cancel1()
-	out1 := stdout1.String()
-	result["steps"].(map[string]any)["full_v6"] = map[string]any{
-		"stdout":  out1[:min(3000, len(out1))],
-		"success": err1 == nil,
-	}
-	if err1 != nil {
-		se := stderr1.String()
-		if len(se) > 0 {
-			result["steps"].(map[string]any)["full_v6"].(map[string]any)["stderr"] = se[:min(500, len(se))]
-		}
-		result["success"] = false
-		result["error"] = "failed at step: full_v6 (accept-referral + OAuth)"
-		return jsonResponse(http.StatusOK, result)
-	}
-
-	// Parse full_v6 JSON output (JSON is on the last line of stdout)
-	var v6Result map[string]any
-	// 提取最后一行 JSON（_full_v6.py 先输出日志，最后一行是 JSON）
-	out1Trimmed := strings.TrimSpace(out1)
-	out1Lines := strings.Split(out1Trimmed, "\n")
-	jsonLine := out1Lines[len(out1Lines)-1]
-	if json.Unmarshal([]byte(jsonLine), &v6Result) != nil {
-		// fallback: 从 stdout 全文搜索包含 "success" 的 JSON 行
-		for _, line := range out1Lines {
-			if strings.Contains(line, `"success"`) && strings.HasPrefix(strings.TrimSpace(line), "{") {
-				if json.Unmarshal([]byte(strings.TrimSpace(line)), &v6Result) == nil {
-					break
-				}
-			}
-		}
-	}
-	if v6Result != nil {
-		if errMsg, ok := v6Result["error"]; ok {
-			result["success"] = false
-			result["error"] = errMsg
-			return jsonResponse(http.StatusOK, result)
-		}
-		if aid, ok := v6Result["account_id"]; ok {
-			result["account_id"] = aid
-		}
-		if ta, ok := v6Result["tracking_after_accept"]; ok {
-			result["tracking_after_accept"] = ta
-		}
-		if oauth, ok := v6Result["oauth_status"]; ok {
-			result["oauth_status"] = oauth
-		}
-		if success, ok := v6Result["success"]; ok {
-			result["v6_success"] = success
-		}
-	}
-
-	// DRY RUN stops here (no message sending)
-	if isDryRun {
-		result["success"] = true
-		result["message"] = "DRY RUN complete. Restart Codex app and run _codex_send_msg.py to send message."
-		return jsonResponse(http.StatusOK, result)
-	}
-
-	// Step 2: _codex_send_msg.py (send message in Codex app)
-	if _, err := os.Stat(sendScript); err != nil {
-		result["success"] = false
-		result["error"] = "_codex_send_msg.py not found (needed for message sending)"
-		return jsonResponse(http.StatusOK, result)
-	}
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Minute)
-	cmd2 := exec.CommandContext(ctx2, pyExe, sendScript, "--msg", "Say hello")
-	var stdout2, stderr2 bytes.Buffer
-	cmd2.Stdout = &stdout2
-	cmd2.Stderr = &stderr2
-	err2 := cmd2.Run()
-	cancel2()
-	out2 := stdout2.String()
-	result["steps"].(map[string]any)["send_msg"] = map[string]any{
-		"stdout":  out2[:min(2000, len(out2))],
-		"success": err2 == nil,
-	}
-	if err2 != nil {
-		result["send_msg_error"] = err2.Error()
-	}
-
-	result["success"] = true
-	return jsonResponse(http.StatusOK, result)
+func handleDesktopActivate(_ pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	return jsonResponse(http.StatusGone, map[string]any{"error": "local activation is not supported by this plugin"})
 }
 
 func splitEmailList(raw string) []string {
@@ -2402,15 +2158,36 @@ func parseCodexCredential(raw []byte) (codexCredential, error) {
 }
 
 func sendInvite(ctx context.Context, cfg pluginConfig, credential codexCredential, account accountInfo, emails []string, referralKey string, requestCookie string, proxyURL string) (inviteResponse, error) {
-	// Try the new referral invite endpoint first (program_id/entrypoint body shape used by
-	// the Codex desktop app). Fall back to the legacy wham endpoint if the new one is not
-	// available for this account.
 	result, errV2 := sendInviteV2(ctx, cfg, credential, account, emails, requestCookie, proxyURL)
-	if errV2 == nil && result.OK {
+	if errV2 != nil {
+		// A transport/read error is ambiguous for a state-changing request: the server may
+		// already have accepted the invitation. Never retry it through the legacy endpoint.
+		return inviteResponse{}, errV2
+	}
+	if result.OK {
 		return result, nil
 	}
-	// Legacy fallback.
-	return sendInviteLegacy(ctx, cfg, credential, account, emails, referralKey, requestCookie, proxyURL)
+	if !legacyInviteFallbackStatus(result.StatusCode) {
+		return result, httpStatusError{status: http.StatusBadGateway, msg: fmt.Sprintf("V2 invite endpoint rejected request: status %d", result.StatusCode)}
+	}
+
+	legacy, errLegacy := sendInviteLegacy(ctx, cfg, credential, account, emails, referralKey, requestCookie, proxyURL)
+	if errLegacy != nil {
+		return inviteResponse{}, errLegacy
+	}
+	if !legacy.OK {
+		return legacy, httpStatusError{status: http.StatusBadGateway, msg: fmt.Sprintf("legacy invite endpoint rejected request: status %d", legacy.StatusCode)}
+	}
+	return legacy, nil
+}
+
+func legacyInviteFallbackStatus(status int) bool {
+	switch status {
+	case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusGone, http.StatusNotImplemented:
+		return true
+	default:
+		return false
+	}
 }
 
 // sendInviteV2 posts to /backend-api/referrals/invite with the new body shape
@@ -4333,12 +4110,6 @@ func renderUsagePage(cfg pluginConfig) string {
         <button id="redeem" type="button" class="warning" data-i18n="account.redeem">Redeem reward</button>
         <button id="clearResult" class="secondary" type="button" data-i18n="account.clear">Clear</button>
       </div>
-      <div class="actions" style="margin-top:8px">
-        <input id="activateEmail" type="text" placeholder="email@example.com" style="flex:1;min-width:200px">
-        <input id="activateCard" type="text" placeholder="LeadBee card (empty=dry run)" style="flex:1;min-width:200px">
-        <button id="activate" type="button" class="warning" data-i18n="account.activate">Activate</button>
-        <button id="desktopActivate" type="button" class="warning" data-i18n="account.desktopActivate" title="CDP OAuth + auth.json injection + Codex app message (triggers codex_turn)">Desktop Activate</button>
-      </div>
       <p class="hint" data-i18n="account.hint">
         Query usage: calls GET /backend-api/codex/usage to read credit balance, rate-limit usage,
         and referral-granted reset credits. Query remaining invites: probes /backend-api/wham/referrals/status then
@@ -4898,92 +4669,11 @@ func renderUsagePage(cfg pluginConfig) string {
           redeemBtn.disabled = usageBtn.disabled = refsBtn.disabled = false;
         }
       }
-      // Activate: one-click full chain (email + card → _full_v5.py)
-      const activateBtn = document.getElementById('activate');
-      const activateEmailInput = document.getElementById('activateEmail');
-      const activateCardInput = document.getElementById('activateCard');
-      async function activateAccount() {
-        const email = (activateEmailInput && activateEmailInput.value.trim()) || '';
-        const card = (activateCardInput && activateCardInput.value.trim()) || '';
-        if (!email) { showResult(t('error.title'), [['message', 'email required']], { error: 'email required' }); return; }
-        const isDryRun = !card;
-        const label = isDryRun ? 'DRY RUN' : 'ACTIVATE';
-        if (!window.confirm(isDryRun
-          ? 'DRY RUN: run full chain for ' + email + ' without consuming a card?'
-          : 'ACTIVATE: consume card ' + card.slice(0, 8) + '... for ' + email + '? This will run the full chain including phone verification.')) return;
-        activateBtn.disabled = usageBtn.disabled = refsBtn.disabled = redeemBtn.disabled = true;
-        try {
-          showResult(label + ' in progress...', [['email', email], ['card', card ? card.slice(0, 8) + '...' : '(dry run)'], ['status', 'Running _full_v5.py... (this may take 5-10 minutes)']], {});
-          const response = await fetch('/v0/management/codex-invite/activate', {
-            method: 'POST',
-            headers: Object.assign({}, authHeaders(), { 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ email: email, card: card })
-          });
-          const data = await readJSON(response);
-          if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
-          const rows = [
-            ['email', data.email || email],
-            ['success', data.success ? '✅' : '❌'],
-            ['phone_verified', data.phone_verified ? '✅' : '❌'],
-            ['codex_launched', data.codex_launched ? '✅' : '❌'],
-            ['cpa_exported', data.cpa_exported ? '✅' : '❌'],
-            ['account_id', data.account_id || '—'],
-          ];
-          if (data.error) rows.push(['error', data.error]);
-          if (data.cpa_path) rows.push(['cpa_path', data.cpa_path]);
-          showResult(data.success ? '✅ ' + label + ' succeeded' : '❌ ' + label + ' failed', rows, data);
-        } catch (e) {
-          showResult(label + ' failed', [['message', String(e.message || e)]], { error: String(e.message || e) });
-        } finally {
-          activateBtn.disabled = usageBtn.disabled = refsBtn.disabled = redeemBtn.disabled = false;
-        }
-      }
     localeSelect.addEventListener('change', () => changeLocale(localeSelect.value));
     reloadBtn.addEventListener('click', () => guardKey(loadAccounts));
     usageBtn.addEventListener('click', () => guardKey(() => queryEndpoint('/v0/management/codex-invite/usage', 'Usage')));
     refsBtn.addEventListener('click', () => guardKey(() => queryEndpoint('/v0/management/codex-invite/referrals', 'Referrals')));
     redeemBtn.addEventListener('click', () => guardKey(redeemReward));
-    activateBtn.addEventListener('click', () => guardKey(activateAccount));
-    // Desktop Activate: CDP OAuth + auth.json + Codex app message
-    const desktopActivateBtn = document.getElementById('desktopActivate');
-    if (desktopActivateBtn) {
-      desktopActivateBtn.addEventListener('click', () => guardKey(async () => {
-        const email = (activateEmailInput && activateEmailInput.value.trim()) || '';
-        if (!email) { showResult(t('error.title'), [['message', 'email required']], { error: 'email required' }); return; }
-        const cardVal = (activateCardInput && activateCardInput.value.trim()) || '';
-        const isDryRunDesktop = !cardVal;
-        if (!window.confirm(isDryRunDesktop
-          ? 'Desktop Activate (DRY RUN): run accept-referral + OTP login for ' + email + '?'
-          : 'Desktop Activate: run full chain (accept-referral + OTP + OAuth + send message) for ' + email + '?')) return;
-        desktopActivateBtn.disabled = true;
-        try {
-          showResult('Desktop Activate in progress...', [['email', email], ['card', cardVal ? cardVal.slice(0, 8) + '...' : '(dry run)'], ['status', 'Running accept-referral → OTP → OAuth → auth.json...']], {});
-          const response = await fetch('/v0/management/codex-invite/desktop-activate', {
-            method: 'POST',
-            headers: Object.assign({}, authHeaders(), { 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ email: email, card: cardVal })
-          });
-          const data = await readJSON(response);
-          if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
-          const rows = [['email', data.email || email], ['dry_run', data.dry_run ? '✅' : '❌'], ['success', data.success ? '✅' : '❌']];
-          if (data.tracking_after_accept) rows.push(['tracking', data.tracking_after_accept]);
-          if (data.oauth_status) rows.push(['oauth', data.oauth_status]);
-          if (data.account_id) rows.push(['account_id', String(data.account_id).slice(0, 16) + '...']);
-          if (data.steps) {
-            for (const [name, stepData] of Object.entries(data.steps)) {
-              const sd = stepData || {};
-              rows.push(['step.' + name, sd.success === false ? '❌' : '✅']);
-            }
-          }
-          if (data.error) rows.push(['error', data.error]);
-          showResult(data.success ? '✅ Desktop Activate succeeded' : '❌ Desktop Activate failed', rows, data);
-        } catch (e) {
-          showResult('Desktop Activate failed', [['message', String(e.message || e)]], { error: String(e.message || e) });
-        } finally {
-          desktopActivateBtn.disabled = false;
-        }
-      }));
-    }
     clearBtn.addEventListener('click', () => { resultPanel.hidden = true; metrics.innerHTML = ''; rawPre.textContent = ''; });
 
     applyLocale();

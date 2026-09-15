@@ -4,12 +4,21 @@ A [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) plugin that sends 
 
 Fork of [LTbinglingfeng/cpa-plugin-codex-invite](https://github.com/LTbinglingfeng/cpa-plugin-codex-invite) with major additions: Codex usage query, remaining-invite reward query (reverse-engineered from the Codex desktop app), uTLS Cloudflare bypass, bilingual UI (English / 中文), and the new-v2 referral invite endpoint.
 
+
+## Current-head safety boundaries
+
+CDK dispatch is disabled when `cdk_site_url` is absent or invalid. No third-party service is selected by default. Configure only an HTTPS origin you explicitly trust to receive CDK credentials; the plugin does not verify the site's ownership. Redirects are not followed for CDK requests. Dispatch request `base_url` is restricted to the same ChatGPT origin as other credential-bearing requests.
+
+The former machine-specific `/activate`, `/cdp-activate`, and `/desktop-activate` hooks are retired. They are no longer advertised or shown in the dashboard; direct calls return HTTP 410 without locating or running external scripts. Query, invite, and separately configured dispatch APIs remain available.
+
+Malformed, oversized, and non-object query bodies fail before account lookup. These changes are scoped hardening, not a blanket security approval: the transport lifecycle, management-origin trust, and redemption retry identity still require independent review. The upstream contribution remains Draft.
+
 ## Features
 
 ### Send invites (Codex Invite page)
 
 - Pick a Codex credential from your CPA auth files **or manually enter an `access_token` / `account_id`** (for credentials not managed by CPA). Manual credentials are used in-memory only and never persisted.
-- Uses the **new referral invite endpoint** (`POST /backend-api/referrals/invite` with `program_id` / `entrypoint` / `emails`) reverse-engineered from the Codex desktop app, with automatic fallback to the legacy `wham/referrals/invite` endpoint.
+- Uses the **new referral invite endpoint** (`POST /backend-api/referrals/invite` with `program_id` / `entrypoint` / `emails`) reverse-engineered from the Codex desktop app, with legacy fallback only for definitive unsupported-endpoint responses (404, 405, 410, or 501). Transport failures, authentication failures, rate limits, and ambiguous server errors never cause an automatic second send.
 - Supports proxy (HTTP / HTTPS / SOCKS5).
 
 ### Query usage (Codex Usage page)
@@ -42,7 +51,7 @@ Fork of [LTbinglingfeng/cpa-plugin-codex-invite](https://github.com/LTbinglingfe
 
 ## CDK dispatch (v0.4.0)
 
-`POST /v0/management/codex-invite/dispatch` — end-to-end CDK redemption against the card site (`cdk_site_url`, default `https://abc.dpzxsm.qzz.io`; config-only, never request-overridable since CDKs are credentials): per CDK it runs **lookup → invite from the selected account → trigger auto-accept → poll status** until redemption. Non-ready CDKs are skipped (idempotent), a failed invite never consumes the CDK, and `dry_run` previews which CDKs are ready. The invite page gains a **CDK 派发** panel.
+`POST /v0/management/codex-invite/dispatch` — end-to-end CDK redemption against the card site (`cdk_site_url`, disabled until the operator explicitly configures a trusted HTTPS origin; never request-overridable since CDKs are credentials): per CDK it runs **lookup → invite from the selected account → trigger auto-accept → poll status** until redemption. Non-ready CDKs are skipped (idempotent), a failed invite never consumes the CDK, and `dry_run` previews which CDKs are ready. The invite page gains a **CDK 派发** panel.
 
 Compatibility fixes in the same release:
 - An invalid `base_url` in plugin YAML now **downgrades to the default instead of failing the whole plugin load** (request-level checks stay strict).

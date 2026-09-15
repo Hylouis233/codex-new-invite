@@ -108,3 +108,42 @@ func (request *autoAssignRequest) UnmarshalJSON(data []byte) error {
 	*request = autoAssignRequest(decoded)
 	return nil
 }
+
+// dispatchRequest must enforce the same credential origin as invite/auto-assign.
+func (request *dispatchRequest) UnmarshalJSON(data []byte) error {
+	type wireDispatchRequest dispatchRequest
+	var decoded wireDispatchRequest
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	baseURL, err := normalizeCredentialBaseURL(decoded.BaseURL)
+	if err != nil {
+		return err
+	}
+	decoded.BaseURL = baseURL
+	*request = dispatchRequest(decoded)
+	return nil
+}
+
+// normalizeCDKSiteURL accepts only an explicit HTTPS origin, never a URL with
+// embedded credentials, an alternate path, or query/fragment URL suffixes.
+// Host ownership remains the operator's trust decision; HTTPS alone does not verify it.
+func normalizeCDKSiteURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid CDK origin")
+	}
+	path := parsed.EscapedPath()
+	if parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil ||
+		(path != "" && path != "/") || parsed.RawQuery != "" || parsed.ForceQuery ||
+		parsed.Fragment != "" || strings.Contains(raw, "#") || parsed.Opaque != "" {
+		return "", fmt.Errorf("CDK site must be an HTTPS origin without credentials, path, query or fragment")
+	}
+	parsed.Path = ""
+	parsed.RawPath = ""
+	return parsed.String(), nil
+}
