@@ -1,0 +1,40 @@
+name: Current-head source review
+on:
+  push:
+    branches: [audit/current-head-20260915]
+    paths: [.github/workflows/current-head-source-audit.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    if: github.repository == 'Hylouis233/codex-new-invite'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: 926c388f16826509ccbb676cb29135f39433d8c8
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export tracked source without executing repository code
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/current-head-source"
+          mkdir -p "$out"
+          test "$(git rev-parse HEAD)" = 926c388f16826509ccbb676cb29135f39433d8c8
+          git rev-parse HEAD HEAD^{tree} > "$out/source-identity.txt"
+          git ls-tree -r HEAD > "$out/tracked-tree.txt"
+          git archive --format=tar.gz HEAD > "$out/source.tar.gz"
+          if old=$(git rev-parse --verify '49dca19^{commit}' 2>/dev/null); then
+            printf '%s\n' "$old" > "$out/previous-reviewed-commit.txt"
+            git diff --stat "$old" HEAD > "$out/changes-since-review.txt"
+            git diff "$old" HEAD > "$out/changes-since-review.patch"
+          fi
+          (cd "$out" && sha256sum source.tar.gz > SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cpa-current-head-source-926c388
+          path: ${{ runner.temp }}/current-head-source/
+          retention-days: 7
+          if-no-files-found: error
